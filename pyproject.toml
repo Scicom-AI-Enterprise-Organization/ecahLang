@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ecahlang"
+version = "0.1.0"
+description = "Continuous Batching LLM Inference with FlashInfer"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "flashinfer-python>=0.2.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "uvloop>=0.19.0",
+    "pynvml>=11.5.0",
+    "pydantic>=2.0.0",
+    "sse-starlette>=1.6.0",
+    "tqdm>=4.60.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Scicom-AI-Enterprise-Organization/ecahLang"
+
+[project.scripts]
+ecahlang = "ecahlang.entrypoints.api_server:run"
+
+[tool.setuptools.packages.find]
+include = ["ecahlang*"]
