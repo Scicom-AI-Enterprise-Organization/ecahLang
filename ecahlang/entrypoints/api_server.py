@@ -29,7 +29,20 @@ from ..core.request_state import RequestState
 from ..core.scheduler import Scheduler
 from ..mem.paged_kv_manager import PagedKVCacheManager
 from ..model_executor.model_runner import ModelRunner
+from ..model_executor.cuda_graph_runner import CUDAGraphDecodeWrapper
 from .streaming import stream_tokens, format_sse_stream, collect_non_stream_response
+
+
+def _get_warmup_bucket_sizes(max_sequence):
+    """Generate power-of-2 bucket sizes for warmup, like vLLM."""
+    sizes = []
+    s = 1
+    while s <= max_sequence:
+        sizes.append(s)
+        s *= 2
+    if sizes[-1] != max_sequence:
+        sizes.append(max_sequence)
+    return sizes
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +116,18 @@ async def handle_completion(form, request, is_chat=False):
     """Shared handler for both /completions and /chat/completions."""
     created = int(time.time())
     request_id = request.state.request_id
+    loop = asyncio.get_event_loop()
 
     if is_chat:
-        prompt = model_runner.apply_chat_template(form.messages)
+        prompt = await loop.run_in_executor(
+            None, model_runner.apply_chat_template, form.messages,
+        )
     else:
         prompt = form.prompt
 
-    input_ids = model_runner.tokenize(prompt)
+    input_ids = await loop.run_in_executor(
+        None, model_runner.tokenize, prompt,
+    )
 
     req_state = RequestState(
         request_id=request_id,
@@ -198,12 +216,14 @@ async def startup_event():
         kv_manager.free(request.state.request_id)
 
     # Optional: torch.compile warmup
+    bucket_sizes = _get_warmup_bucket_sizes(args.max_sequence)
+
     if args.torch_compile:
         model_runner.setup_torch_compile()
-        logger.info('Warming up torch.compile...')
-        for i in tqdm(range(args.max_sequence), desc='warming up torch.compile'):
+        logger.info(f'Warming up torch.compile with bucket sizes: {bucket_sizes}')
+        for batch_size in tqdm(bucket_sizes, desc='warming up torch.compile'):
             tasks = []
-            for k in range(i + 1):
+            for k in range(batch_size):
                 request = Request(dummy_scope.copy(), receive=receive)
                 request.state.request_id = f'dummy-{k}'
                 task = asyncio.create_task(
@@ -213,8 +233,28 @@ async def startup_event():
 
             await asyncio.gather(*tasks)
 
-            for k in range(i + 1):
+            for k in range(batch_size):
                 kv_manager.free(f'dummy-{k}')
+
+    if args.cuda_graph:
+        logger.info(f'Warming up CUDA graphs with bucket sizes: {bucket_sizes}')
+        cuda_graph_wrapper = CUDAGraphDecodeWrapper(model_runner.decode_forward)
+        for batch_size in tqdm(bucket_sizes, desc='warming up CUDA graphs'):
+            tasks = []
+            for k in range(batch_size):
+                request = Request(dummy_scope.copy(), receive=receive)
+                request.state.request_id = f'dummy-{k}'
+                task = asyncio.create_task(
+                    chat_completions(form=ChatCompletionForm(), request=request)
+                )
+                tasks.append(task)
+
+            await asyncio.gather(*tasks)
+
+            for k in range(batch_size):
+                kv_manager.free(f'dummy-{k}')
+
+        scheduler.cuda_graph_wrapper = cuda_graph_wrapper
 
     logger.info('ecahLang ready to serve')
 

@@ -19,6 +19,7 @@ from contextlib import nullcontext
 from ..model_executor.attention import set_attention_state
 from ..sampling.sampler import logits_to_probs
 from ..managers.detokenizer import background_batch_decode
+from ..managers.overlap import OverlapManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,12 @@ class Scheduler:
             )
         else:
             self.profiler = nullcontext()
+
+        # CUDA stream overlap
+        self.overlap = OverlapManager(enabled=True)
+
+        # CUDA graph wrapper (set during startup warmup if enabled)
+        self.cuda_graph_wrapper = None
 
         # Background tasks (set during startup)
         self._prefill_task = None
@@ -181,32 +188,35 @@ class Scheduler:
                         self.kv_manager.decode_layer_idx = 0
                         self.kv_manager.decode_batch_ids = uuids
 
-                    # Forward pass
+                    # Forward pass on compute stream (overlap GPU with CPU prep)
                     forward_fn = self.model_runner.forward if prefill else self.model_runner.decode_forward
-                    output = forward_fn(
-                        input_ids=input_ids,
-                        position_ids=position_ids,
-                        wrapper=wrapper,
-                        manager=self.kv_manager,
-                        prefill=prefill,
-                        append_indptr=append_indptr,
-                    )
+                    with self.overlap.compute_stream():
+                        output = forward_fn(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            wrapper=wrapper,
+                            manager=self.kv_manager,
+                            prefill=prefill,
+                            append_indptr=append_indptr,
+                        )
 
-                    # Extract last-token logits per sequence
-                    logits = output.logits[0, append_indptr[1:] - 1]
-
-                    # Prepare sampling params
+                    # Prepare sampling params on CPU while GPU may still be computing
                     temperature = torch.concat(temperature)[None].T
                     top_k = torch.concat(top_k)
                     top_p = torch.concat(top_p)
 
-                    # Build repetition penalty mask
                     mask_penalty = []
                     for uuid in uuids:
                         mask_penalty.append(
                             self.kv_manager.mask_penalty[self.kv_manager.batch_to_seq_len[uuid]]
                         )
                     mask_penalty = torch.stack(mask_penalty)
+
+                    # Sync: wait for forward pass to finish before reading logits
+                    self.overlap.synchronize()
+
+                    # Extract last-token logits per sequence
+                    logits = output.logits[0, append_indptr[1:] - 1]
 
                     # Sample next tokens
                     idx_next = logits_to_probs(logits, mask_penalty, temperature, top_k, top_p)
