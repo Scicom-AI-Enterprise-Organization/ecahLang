@@ -1,44 +1,11 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-*.egg
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# uv
-uv.lock
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment variables
-.env
-.env.local
-
-# Profiling traces
-*.json
-!package.json
-
-# Torch compile cache
-__torch_compile_cache/
-
-# Logs
-*.log
+*.ipynb
+*.ipynb_checkpoints
+*__pycache__
+*egg-info
+logs
+out
+output.log
+benchmark/*warmup
+decode-*.json
+prefill-*.json
+!plot-benchmark.ipynb
