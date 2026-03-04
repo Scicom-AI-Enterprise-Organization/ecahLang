@@ -1,6 +1,6 @@
 {
-    "first_token_avg": 0.14125099182128906,
-    "total_response_avg": 47.69318823814392,
+    "first_token_avg": 0.04183554649353027,
+    "total_response_avg": 10.511817955970765,
     "total_token": 3840,
     "average_token": 384.0
 }
