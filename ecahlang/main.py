@@ -234,6 +234,7 @@ async def add_request_id_and_time(request: Request, call_next):
     return response
 
 async def process_queue(queue, wrapper, prefill):
+    fwd_stream = torch.cuda.Stream()
     global_step = 0
     need_sleep = True
     while True:
@@ -308,31 +309,40 @@ async def process_queue(queue, wrapper, prefill):
                 setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
                 forward = model if prefill else decode
-                output = forward(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    use_cache=False,
-                    wrapper=wrapper,
-                    manager=manager,
-                    prefill=prefill,
-                    append_indptr=append_indptr,
-                )
-                logits = output.logits[0, append_indptr[1:] - 1]
-                temperature = torch.concat(temperature)[None].T
-                top_k = torch.concat(top_k)
-                top_p = torch.concat(top_p)
 
-                mask_penalty = []
-                for uuid in uuids:
-                    mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
-                mask_penalty = torch.stack(mask_penalty)
+                # Overlap: ensure fwd_stream waits for prior default-stream work (wrapper.plan)
+                fwd_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(fwd_stream):
+                    output = forward(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        wrapper=wrapper,
+                        manager=manager,
+                        prefill=prefill,
+                        append_indptr=append_indptr,
+                    )
+                    logits = output.logits[0, append_indptr[1:] - 1]
+                    temperature = torch.concat(temperature)[None].T
+                    top_k = torch.concat(top_k)
+                    top_p = torch.concat(top_p)
 
-                logits = logits / mask_penalty
-                logits = logits / temperature
+                    mask_penalty = []
+                    for uuid in uuids:
+                        mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
+                    mask_penalty = torch.stack(mask_penalty)
 
-                idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                    logits, top_k=top_k, top_p=top_p, deterministic=True,
-                )[None].T
+                    logits = logits / mask_penalty
+                    logits = logits / temperature
+
+                    idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                        logits, top_k=top_k, top_p=top_p, deterministic=True,
+                    )[None].T
+
+                # Overlap: yield to event loop while GPU finishes on fwd_stream
+                # This lets the other queue (prefill/decode) collect and prepare its next batch
+                await asyncio.sleep(0)
+                fwd_stream.synchronize()
 
                 tokens = tokenizer.batch_decode(idx_next)
 
