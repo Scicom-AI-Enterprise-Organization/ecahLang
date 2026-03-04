@@ -46,7 +46,7 @@ def ecah_attention(
     manager = kwargs.get('manager')
     prefill = kwargs.get('prefill')
     append_indptr = kwargs.get('append_indptr')
-    
+
     if args.need_autocast:
         query = query.to(args.torch_dtype)
         key = key.to(args.torch_dtype)
@@ -70,7 +70,7 @@ def ecah_attention(
         masks = []
         for l in diff:
             masks.append(torch.tril(torch.ones(l, l)))
-            
+
         masks = block_diagonal_concat_inverted(*masks, dtype = query.dtype).cuda()
         q = query.transpose(0, 1)[None]
         k = key.transpose(0, 1)[None]
@@ -98,10 +98,10 @@ def ecah_attention(
 def load_model():
     global tokenizer, model, manager
     global num_layers, num_heads, num_key_value_heads, head_dim, vocab_size, eos_token_id
-    
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, attn_implementation="ecah_attention", 
+        args.model, attn_implementation="ecah_attention",
         torch_dtype = args.model_dtype).eval().cuda()
     eos_token_id = model.generation_config.eos_token_id
     if not isinstance(eos_token_id, list):
@@ -116,9 +116,9 @@ def load_model():
     head_dim = getattr(
         config, "head_dim", config.hidden_size // config.num_attention_heads)
     manager = AutoKVCacheManager(
-        num_layers, 
-        num_key_value_heads, 
-        head_dim, 
+        num_layers,
+        num_key_value_heads,
+        head_dim,
         dtype=args.torch_dtype,
         mem_utilization=args.memory_utilization,
         vocab_size=vocab_size,
@@ -143,7 +143,7 @@ class CUDAGraphDecodeWrapper:
         with torch.cuda.graph(g):
             self.static_outputs[key] = self.decode_fn(**self.static_inputs[key])
         self.graphs[key] = g
-    
+
     def run(self, key, **new_inputs):
         for k in new_inputs:
             if isinstance(new_inputs[k], torch.Tensor):
@@ -237,22 +237,27 @@ async def process_queue(queue, wrapper, prefill):
     fwd_stream = torch.cuda.Stream()
     global_step = 0
     need_sleep = True
+    next_batch = None  # Phase 2: pre-collected batch buffer
+
     while True:
-        if need_sleep:
-            await asyncio.sleep(args.microsleep)
-
-        need_sleep = True
-        batch = []
-
-        while not queue.empty():
-            try:
-                request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                batch.append(request)
-                if len(batch) >= args.max_sequence:
-                    need_sleep = False
+        # Phase 2: use pre-collected batch if available, otherwise collect fresh
+        if next_batch is not None:
+            batch = next_batch
+            next_batch = None
+        else:
+            if need_sleep:
+                await asyncio.sleep(args.microsleep)
+            need_sleep = True
+            batch = []
+            while not queue.empty():
+                try:
+                    request = await asyncio.wait_for(queue.get(), timeout=1e-6)
+                    batch.append(request)
+                    if len(batch) >= args.max_sequence:
+                        need_sleep = False
+                        break
+                except asyncio.TimeoutError:
                     break
-            except asyncio.TimeoutError:
-                break
 
         if not len(batch):
             continue
@@ -260,6 +265,7 @@ async def process_queue(queue, wrapper, prefill):
         with profiler as prof:
             futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
             temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
+            rep_penalties = [b[8] if len(b) > 8 else torch.tensor(1.0).cuda() for b in batch]
             lengths_cpu = [inp.shape[0] for inp in inputs]
 
             try:
@@ -274,7 +280,7 @@ async def process_queue(queue, wrapper, prefill):
                         manager.allocate(uuids[no], l)
                     else:
                         manager.append_tokens(uuids[no], l)
-                    
+
                 input_ids = torch.concat(inputs)[None]
                 lengths = torch.concat([empty_length] + list(lengths))
                 append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
@@ -323,44 +329,150 @@ async def process_queue(queue, wrapper, prefill):
                         append_indptr=append_indptr,
                     )
                     logits = output.logits[0, append_indptr[1:] - 1]
-                    temperature = torch.concat(temperature)[None].T
-                    top_k = torch.concat(top_k)
-                    top_p = torch.concat(top_p)
+                    temperature_t = torch.concat(temperature)[None].T
+                    top_k_t = torch.concat(top_k)
+                    top_p_t = torch.concat(top_p)
 
                     mask_penalty = []
-                    for uuid in uuids:
-                        mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
+                    for u in uuids:
+                        mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[u]])
                     mask_penalty = torch.stack(mask_penalty)
 
                     logits = logits / mask_penalty
-                    logits = logits / temperature
+                    logits = logits / temperature_t
 
                     idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                        logits, top_k=top_k, top_p=top_p, deterministic=True,
+                        logits, top_k=top_k_t, top_p=top_p_t, deterministic=True,
                     )[None].T
 
-                # Overlap: yield to event loop while GPU finishes on fwd_stream
-                # This lets the other queue (prefill/decode) collect and prepare its next batch
+                # Phase 2: yield to event loop while GPU still running
                 await asyncio.sleep(0)
+
+                # Phase 2: pre-collect next batch while GPU finishes
+                next_batch = []
+                while not queue.empty() and len(next_batch) < args.max_sequence:
+                    try:
+                        request = await asyncio.wait_for(queue.get(), timeout=1e-6)
+                        next_batch.append(request)
+                    except asyncio.TimeoutError:
+                        break
+                if not next_batch:
+                    next_batch = None
+
                 fwd_stream.synchronize()
 
-                tokens = tokenizer.batch_decode(idx_next)
+                # Phase 3: multi-step decode loop
+                num_steps = args.multi_step if not prefill else 1
+                if num_steps > 1:
+                    accumulated = [[(idx_next[i], None, idx_next[i][0] in eos_token_id)] for i in range(len(uuids))]
+                    active_mask = [not (idx_next[i][0] in eos_token_id) for i in range(len(uuids))]
+                    position_ids_track = [position_ids[0, i].item() + 1 for i in range(len(uuids))]
 
-                for i, fut in enumerate(futures):
-                    fut.set_result((idx_next[i], tokens[i]))
+                    # apply repetition penalty for step 0
+                    for i in range(len(uuids)):
+                        if rep_penalties[i] > 1:
+                            manager.mask_penalty[manager.batch_to_seq_len[uuids[i]], idx_next[i][0]] /= rep_penalties[i]
+
+                    for step in range(1, num_steps):
+                        active_indices = [i for i, a in enumerate(active_mask) if a]
+                        if not active_indices:
+                            break
+
+                        step_input_ids = torch.stack([idx_next[i] for i in active_indices]).T  # [1, active_batch]
+                        step_position_ids = torch.tensor([position_ids_track[i] for i in active_indices])[None].cuda()
+
+                        for i in active_indices:
+                            manager.append_tokens(uuids[i], 1)
+
+                        active_uuids = tuple(uuids[i] for i in active_indices)
+                        kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(active_uuids)
+                        wrapper.plan(
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_len,
+                            num_heads,
+                            num_key_value_heads,
+                            head_dim,
+                            manager.block_size,
+                            pos_encoding_mode="NONE",
+                            q_data_type=args.torch_dtype,
+                        )
+
+                        setattr(manager, "decode_layer_idx", 0)
+                        setattr(manager, "decode_batch_ids", active_uuids)
+
+                        fwd_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(fwd_stream):
+                            step_output = forward(
+                                input_ids=step_input_ids,
+                                position_ids=step_position_ids,
+                                use_cache=False,
+                                wrapper=wrapper,
+                                manager=manager,
+                                prefill=False,
+                                append_indptr=append_indptr[:len(active_indices) + 1] if len(active_indices) < len(uuids) else append_indptr,
+                            )
+                            step_logits = step_output.logits[0]
+
+                            step_mask_penalty = []
+                            for i in active_indices:
+                                step_mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuids[i]]])
+                            step_mask_penalty = torch.stack(step_mask_penalty)
+
+                            step_temp = torch.stack([temperature[i] for i in active_indices])[None].T
+                            step_top_k = torch.stack([top_k[i] for i in active_indices])
+                            step_top_p = torch.stack([top_p[i] for i in active_indices])
+
+                            step_logits = step_logits / step_mask_penalty
+                            step_logits = step_logits / step_temp
+
+                            step_idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                step_logits, top_k=step_top_k, top_p=step_top_p, deterministic=True,
+                            )[None].T
+
+                        fwd_stream.synchronize()
+
+                        # scatter back into idx_next and accumulate
+                        for local_idx, global_idx in enumerate(active_indices):
+                            token_id = step_idx_next[local_idx]
+                            hit_eos = token_id[0] in eos_token_id
+                            idx_next[global_idx] = token_id
+                            accumulated[global_idx].append((token_id, None, hit_eos))
+                            if hit_eos:
+                                active_mask[global_idx] = False
+                            if rep_penalties[global_idx] > 1:
+                                manager.mask_penalty[manager.batch_to_seq_len[uuids[global_idx]], token_id[0]] /= rep_penalties[global_idx]
+                            position_ids_track[global_idx] += 1
+
+                if num_steps > 1:
+                    loop = asyncio.get_running_loop()
+                    for i in range(len(uuids)):
+                        all_token_ids = torch.stack([t[0] for t in accumulated[i]])
+                        decoded = await loop.run_in_executor(None, tokenizer.batch_decode, all_token_ids)
+                        result = [(accumulated[i][j][0], decoded[j], accumulated[i][j][2]) for j in range(len(accumulated[i]))]
+                        futures[i].set_result(result)
+                else:
+                    # Single step path (prefill or multi_step=1)
+                    # Phase 1: async detokenization
+                    loop = asyncio.get_running_loop()
+                    idx_next_cpu = idx_next.cpu()
+                    tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+
+                    for i, fut in enumerate(futures):
+                        fut.set_result((idx_next[i], tokens[i]))
 
             except Exception as e:
                 for future in futures:
                     if not future.done():
                         future.set_exception(e)
-        
+
         if args.torch_profiling:
             try:
                 mode = 'prefill' if prefill else 'decode'
                 prof.export_chrome_trace(f'{mode}-{global_step}.json')
             except Exception as e:
                 print(e)
-        
+
         global_step += 1
 
 async def prefill():
@@ -368,7 +480,7 @@ async def prefill():
 
 async def step():
     await process_queue(step_queue, decode_wrapper, prefill=False)
-    
+
 async def stream(inputs, created, form, request):
     uuid = request.state.request_id
     initial_length = inputs.shape[0]
@@ -387,12 +499,13 @@ async def stream(inputs, created, form, request):
 
     repetition_penalty = max(1e-5, form.repetition_penalty)
     repetition_penalty_cuda = torch.tensor(repetition_penalty).cuda()
-    
-    for k in range(form.max_tokens):
+
+    k = 0
+    while k < form.max_tokens:
         is_disconnected = await request.is_disconnected()
         if is_disconnected:
             break
-            
+
         if k == 0:
             q = prefill_queue
             length = prefill_l
@@ -402,33 +515,59 @@ async def stream(inputs, created, form, request):
 
         l = k + initial_length
         future = asyncio.Future()
-        await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length))
+        await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length, repetition_penalty_cuda))
         out = await future
-        idx_next, token = out
 
-        if repetition_penalty > 1:
-            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= repetition_penalty_cuda
+        if isinstance(out, list):
+            # Phase 3: multi-step response — list of (idx_next, token, hit_eos)
+            hit_eos_outer = False
+            for step_i, (step_idx_next, step_token, hit_eos) in enumerate(out):
+                if k == 0 and step_i == 0:
+                    request.state.time_first_token = time.time()
+
+                # repetition penalty already applied in process_queue for multi-step
+                if not form.ignore_eos and hit_eos:
+                    hit_eos_outer = True
+                    break
+
+                if args.torch_compile:
+                    step_idx_next = step_idx_next.clone()
+
+                inputs = step_idx_next
+                yield step_token
+                await asyncio.sleep(0)
+
+            k += len(out) if not hit_eos_outer else step_i + 1
+            if hit_eos_outer:
+                break
         else:
-            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= repetition_penalty_cuda
+            # Single step (prefill or multi_step=1)
+            idx_next, token = out
 
-        if k == 0:
-            request.state.time_first_token = time.time()
-        
-        if not form.ignore_eos and idx_next[0] in eos_token_id:
-            break
+            if repetition_penalty > 1:
+                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= repetition_penalty_cuda
+            else:
+                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= repetition_penalty_cuda
 
-        if args.torch_compile:
-            """
-            I got weird overflow if not clone, like (tensor([5256919935786303302], device='cuda:0'),)
-            This will hit CUDA indexing assertion.
-            """
-            idx_next = idx_next.clone()
+            if k == 0:
+                request.state.time_first_token = time.time()
 
-        inputs = idx_next
+            if not form.ignore_eos and idx_next[0] in eos_token_id:
+                break
 
-        yield token
-        await asyncio.sleep(0)
-    
+            if args.torch_compile:
+                """
+                I got weird overflow if not clone, like (tensor([5256919935786303302], device='cuda:0'),)
+                This will hit CUDA indexing assertion.
+                """
+                idx_next = idx_next.clone()
+
+            inputs = idx_next
+
+            yield token
+            await asyncio.sleep(0)
+            k += 1
+
     request.state.total_token = k + initial_length
 
 @app.get('/')
@@ -451,7 +590,7 @@ async def handle_stream_response(func, created, request_id, stream_type="complet
         async for data in func:
             if not isinstance(data, str):
                 continue
-            
+
             if stream_type == "chat":
                 payload = {
                     'id': request_id,
@@ -584,7 +723,7 @@ async def startup_event():
     app.state.background_step = asyncio.create_task(step())
 
     logging.info('warming up')
-    
+
     dummy_scope = {
         "type": "http",
         "http_version": "1.1",
@@ -606,7 +745,7 @@ async def startup_event():
         form = ChatCompletionForm()
         r = await chat_completions_main(form=form, request=request)
         manager.free(request.state.request_id)
-    
+
     if args.torch_compile:
         global decode
 
@@ -618,12 +757,12 @@ async def startup_event():
                 request.state.request_id = f'dummy-{k}'
                 task = asyncio.create_task(chat_completions_main(form=form, request=request))
                 tasks.append(task)
-            
+
             await asyncio.gather(*tasks)
 
             for k in range(i + 1):
                 manager.free(f'dummy-{k}')
-    
+
 if __name__ == "__main__":
     uvicorn.run(
         app,

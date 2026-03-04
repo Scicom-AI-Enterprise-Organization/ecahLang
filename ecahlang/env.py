@@ -78,6 +78,10 @@ def parse_arguments():
         default=os.environ.get('CUDA_GRAPH', 'false').lower() == 'true',
         help='Capture CUDA Graph for decoding and sampling (default: %(default)s, env: CUDA_GRAPH)'
     )
+    parser.add_argument(
+        '--multi_step', default=int(os.environ.get('MULTI_STEP', '1')), type=int,
+        help='Number of decode steps to run per round-trip (default: %(default)s, env: MULTI_STEP)'
+    )
 
     args = parser.parse_args()
 
@@ -99,7 +103,7 @@ def parse_arguments():
 
     args.device = 'cuda'
     args.need_autocast = args.model_dtype == torch.float32
-    
+
     return args
 
 
