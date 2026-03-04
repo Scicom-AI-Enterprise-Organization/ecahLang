@@ -9,3 +9,4 @@ benchmark/*warmup
 decode-*.json
 prefill-*.json
 !plot-benchmark.ipynb
+.venv/

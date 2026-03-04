@@ -1,4 +1,4 @@
-from simple_flashinfer.env import args, logging
+from ecahlang.env import args, logging
 from fastapi import FastAPI, Request, Response
 from fastapi import HTTPException
 from sse_starlette import EventSourceResponse
@@ -23,7 +23,7 @@ import traceback
 import os
 
 @torch.compiler.disable
-def flashinfer_attention(
+def ecah_attention(
     module,
     query,
     key,
@@ -101,7 +101,7 @@ def load_model():
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, attn_implementation="flashinfer_attention", 
+        args.model, attn_implementation="ecah_attention", 
         torch_dtype = args.model_dtype).eval().cuda()
     eos_token_id = model.generation_config.eos_token_id
     if not isinstance(eos_token_id, list):
@@ -163,7 +163,7 @@ num_key_value_heads = None
 head_dim = None
 vocab_size = None
 eos_token_id = None
-AttentionInterface.register("flashinfer_attention", flashinfer_attention)
+AttentionInterface.register("ecah_attention", ecah_attention)
 workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
 workspace_buffer_decode = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")

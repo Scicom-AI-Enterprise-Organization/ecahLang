@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecahlang"
+version = "0.1.0"
+description = "Continuous Batching LLM Inference with FlashInfer"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.53.1",
+    "flashinfer-python",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "uvloop>=0.19.0",
+    "pynvml>=11.5.0",
+    "pydantic>=2.0.0",
+    "sse-starlette>=1.6.0",
+    "tqdm>=4.60.0",
+]
