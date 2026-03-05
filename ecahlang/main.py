@@ -842,6 +842,8 @@ async def chat_completions_main(form: ChatCompletionForm, request: Request = Non
 
 @app.on_event("startup")
 async def startup_event():
+    global decode, decode_and_sample, cuda_graph_runner, bucket_sizes
+
     load_model()
     manager.init_sampling_buffers(args.max_sequence)
     app.state.background_prefill = asyncio.create_task(prefill())
@@ -872,8 +874,6 @@ async def startup_event():
         manager.free(request.state.request_id)
 
     if args.cuda_graph:
-        global cuda_graph_runner, bucket_sizes
-
         bucket_sizes = get_bucket_sizes(args.max_sequence)
         logging.info(f'CUDA Graph bucket sizes: {bucket_sizes}')
 
@@ -924,8 +924,6 @@ async def startup_event():
         logging.info('CUDA Graph warmup complete')
 
     elif args.torch_compile:
-        global decode, decode_and_sample, bucket_sizes
-
         bucket_sizes = get_bucket_sizes(args.max_sequence)
         logging.info(f'torch_compile bucket sizes: {bucket_sizes}')
 
