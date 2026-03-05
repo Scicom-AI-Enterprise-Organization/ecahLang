@@ -163,6 +163,7 @@ def decode(*args, **kwargs):
 
 def decode_and_sample(input_ids, position_ids, append_indptr,
                       mask_penalty, temperature, top_k, top_p):
+    manager.decode_layer_idx = 0
     output = decode(
         input_ids=input_ids, position_ids=position_ids, use_cache=False,
         wrapper=decode_wrapper, manager=manager, prefill=False, append_indptr=append_indptr,
