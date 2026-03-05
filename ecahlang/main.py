@@ -643,7 +643,7 @@ async def stream(inputs, created, form, request):
                     hit_eos_outer = True
                     break
 
-                if args.torch_compile:
+                if args.torch_compile or args.cuda_graph:
                     step_idx_next = step_idx_next.clone()
 
                 inputs = step_idx_next
