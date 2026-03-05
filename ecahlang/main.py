@@ -305,7 +305,7 @@ async def process_queue(queue, wrapper, prefill):
         with profiler as prof:
             futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
             temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
-            rep_penalties = [b[8] if len(b) > 8 else torch.tensor(1.0).cuda() for b in batch]
+            rep_penalties = [b[8] if len(b) > 8 else 1.0 for b in batch]
             lengths_cpu = [inp.shape[0] for inp in inputs]
 
             try:
@@ -347,12 +347,7 @@ async def process_queue(queue, wrapper, prefill):
                     for i, u in enumerate(uuids):
                         padded_mask[i] = manager.mask_penalty[manager.batch_to_seq_len[u]]
 
-                    padded_temp = torch.ones(bucket, 1, dtype=torch.float32, device="cuda")
-                    padded_temp[:n] = torch.concat(temperature)[None].T
-                    padded_top_k = torch.full((bucket,), vocab_size, dtype=torch.int32, device="cuda")
-                    padded_top_k[:n] = torch.concat(top_k)
-                    padded_top_p = torch.ones(bucket, dtype=torch.float32, device="cuda")
-                    padded_top_p[:n] = torch.concat(top_p)
+                    manager.fill_cuda_graph_sampling_params(bucket, n, temperature, top_k, top_p)
 
                     manager.cuda_graph_mode = True
                     manager.decode_layer_idx = 0
@@ -365,9 +360,9 @@ async def process_queue(queue, wrapper, prefill):
                             position_ids=padded_pos[None],
                             append_indptr=manager._cg_append_indptr[bucket],
                             mask_penalty=padded_mask,
-                            temperature=padded_temp,
-                            top_k=padded_top_k,
-                            top_p=padded_top_p,
+                            temperature=manager._cg_temperature[bucket],
+                            top_k=manager._cg_top_k[bucket],
+                            top_p=manager._cg_top_p[bucket],
                         )
 
                     manager.cuda_graph_mode = False
@@ -395,7 +390,7 @@ async def process_queue(queue, wrapper, prefill):
                 else:
                     # ====== ORIGINAL PATH (prefill or non-cuda-graph decode) ======
                     input_ids = torch.concat(inputs)[None]
-                    lengths = torch.concat([empty_length] + list(lengths))
+                    lengths = torch.tensor([0] + list(lengths), device="cuda")
                     append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
 
                     kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
@@ -429,6 +424,9 @@ async def process_queue(queue, wrapper, prefill):
 
                     forward = model if prefill else decode
 
+                    n = len(uuids)
+                    manager.fill_sampling_params(n, temperature, top_k, top_p)
+
                     # Overlap: ensure fwd_stream waits for prior default-stream work (wrapper.plan)
                     fwd_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(fwd_stream):
@@ -442,9 +440,9 @@ async def process_queue(queue, wrapper, prefill):
                             append_indptr=append_indptr,
                         )
                         logits = output.logits[0, append_indptr[1:] - 1]
-                        temperature_t = torch.concat(temperature)[None].T
-                        top_k_t = torch.concat(top_k)
-                        top_p_t = torch.concat(top_p)
+                        temperature_t = manager.sampling_temperature_gpu[:n]
+                        top_k_t = manager.sampling_top_k_gpu[:n]
+                        top_p_t = manager.sampling_top_p_gpu[:n]
 
                         mask_penalty = []
                         for u in uuids:
@@ -532,9 +530,13 @@ async def process_queue(queue, wrapper, prefill):
                                     step_mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuids[i]]])
                                 step_mask_penalty = torch.stack(step_mask_penalty)
 
-                                step_temp = torch.stack([temperature[i] for i in active_indices])[None].T
-                                step_top_k = torch.stack([top_k[i] for i in active_indices])
-                                step_top_p = torch.stack([top_p[i] for i in active_indices])
+                                active_temps = [temperature[i] for i in active_indices]
+                                active_top_ks = [top_k[i] for i in active_indices]
+                                active_top_ps = [top_p[i] for i in active_indices]
+                                manager.fill_sampling_params(len(active_indices), active_temps, active_top_ks, active_top_ps)
+                                step_temp = manager.sampling_temperature_gpu[:len(active_indices)]
+                                step_top_k = manager.sampling_top_k_gpu[:len(active_indices)]
+                                step_top_p = manager.sampling_top_p_gpu[:len(active_indices)]
 
                                 step_logits = step_logits / step_mask_penalty
                                 step_logits = step_logits / step_temp
@@ -600,18 +602,9 @@ async def stream(inputs, created, form, request):
     inputs = inputs.cuda()
 
     temperature = max(1e-5, form.temperature)
-    temperature = torch.tensor([temperature]).cuda()
-
     top_k = vocab_size if form.top_k == 0 else form.top_k
-    top_k = torch.tensor([top_k]).to(torch.int32).cuda()
-
     top_p = 1.0 if form.top_p == 0 else form.top_p
-    top_p = torch.tensor([top_p]).to(torch.float32).cuda()
-
-    prefill_l = torch.tensor([initial_length]).cuda()
-
     repetition_penalty = max(1e-5, form.repetition_penalty)
-    repetition_penalty_cuda = torch.tensor(repetition_penalty).cuda()
 
     k = 0
     while k < form.max_tokens:
@@ -621,14 +614,14 @@ async def stream(inputs, created, form, request):
 
         if k == 0:
             q = prefill_queue
-            length = prefill_l
+            length = initial_length
         else:
             q = step_queue
-            length = decode_length
+            length = 1
 
         l = k + initial_length
         future = asyncio.Future()
-        await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length, repetition_penalty_cuda))
+        await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length, repetition_penalty))
         out = await future
 
         if isinstance(out, list):
@@ -658,9 +651,9 @@ async def stream(inputs, created, form, request):
             idx_next, token = out
 
             if repetition_penalty > 1:
-                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= repetition_penalty_cuda
+                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= repetition_penalty
             else:
-                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= repetition_penalty_cuda
+                manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= repetition_penalty
 
             if k == 0:
                 request.state.time_first_token = time.time()
@@ -833,6 +826,7 @@ async def chat_completions_main(form: ChatCompletionForm, request: Request = Non
 @app.on_event("startup")
 async def startup_event():
     load_model()
+    manager.init_sampling_buffers(args.max_sequence)
     app.state.background_prefill = asyncio.create_task(prefill())
     app.state.background_step = asyncio.create_task(step())
 
@@ -900,9 +894,9 @@ async def startup_event():
                 position_ids=torch.ones(1, bs, dtype=torch.long, device="cuda"),
                 append_indptr=manager._cg_append_indptr[bs],
                 mask_penalty=torch.ones(bs, vocab_size, dtype=args.torch_dtype, device="cuda"),
-                temperature=torch.ones(bs, 1, dtype=torch.float32, device="cuda"),
-                top_k=torch.full((bs,), vocab_size, dtype=torch.int32, device="cuda"),
-                top_p=torch.ones(bs, dtype=torch.float32, device="cuda"),
+                temperature=manager._cg_temperature[bs],
+                top_k=manager._cg_top_k[bs],
+                top_p=manager._cg_top_p[bs],
             )
 
             manager.cuda_graph_mode = False

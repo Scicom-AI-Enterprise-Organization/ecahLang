@@ -71,6 +71,31 @@ class AutoKVCacheManager:
         self._cg_positions = {}
         self._cg_append_indptr = {}
 
+    def init_sampling_buffers(self, max_batch_size):
+        # Pinned CPU buffers (for fast async H2D copy)
+        self.sampling_temperature_cpu = torch.ones(max_batch_size, 1, dtype=torch.float32).pin_memory()
+        self.sampling_top_k_cpu = torch.full((max_batch_size,), self.vocab_size, dtype=torch.int32).pin_memory()
+        self.sampling_top_p_cpu = torch.ones(max_batch_size, dtype=torch.float32).pin_memory()
+
+        # Numpy views for zero-overhead scalar writes
+        self.sampling_temperature_np = self.sampling_temperature_cpu.numpy()
+        self.sampling_top_k_np = self.sampling_top_k_cpu.numpy()
+        self.sampling_top_p_np = self.sampling_top_p_cpu.numpy()
+
+        # GPU buffers (persistent, reused every step)
+        self.sampling_temperature_gpu = torch.ones(max_batch_size, 1, dtype=torch.float32, device="cuda")
+        self.sampling_top_k_gpu = torch.full((max_batch_size,), self.vocab_size, dtype=torch.int32, device="cuda")
+        self.sampling_top_p_gpu = torch.ones(max_batch_size, dtype=torch.float32, device="cuda")
+
+    def fill_sampling_params(self, n, temperatures, top_ks, top_ps):
+        self.sampling_temperature_np[:n, 0] = temperatures
+        self.sampling_top_k_np[:n] = top_ks
+        self.sampling_top_p_np[:n] = top_ps
+
+        self.sampling_temperature_gpu[:n].copy_(self.sampling_temperature_cpu[:n], non_blocking=True)
+        self.sampling_top_k_gpu[:n].copy_(self.sampling_top_k_cpu[:n], non_blocking=True)
+        self.sampling_top_p_gpu[:n].copy_(self.sampling_top_p_cpu[:n], non_blocking=True)
+
     def allocate(self, batch_id, total_tokens):
         num_pages = math.ceil(total_tokens / self.block_size)
         if len(self.free_blocks) < num_pages:
@@ -159,6 +184,9 @@ class AutoKVCacheManager:
             raise RuntimeError(f"Not enough free blocks for {max_bucket} padding pages")
         self.padding_pages = [self.free_blocks.pop() for _ in range(max_bucket)]
 
+        self._cg_temperature = {}
+        self._cg_top_k = {}
+        self._cg_top_p = {}
         for bs in bucket_sizes:
             self._cg_kv_indices[bs] = torch.zeros(self.max_blocks, dtype=torch.int32, device="cuda")
             self._cg_kv_indptr[bs] = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
@@ -166,6 +194,9 @@ class AutoKVCacheManager:
             self._cg_batch_indices[bs] = torch.arange(bs, dtype=torch.int32, device="cuda")
             self._cg_positions[bs] = torch.zeros(bs, dtype=torch.int32, device="cuda")
             self._cg_append_indptr[bs] = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+            self._cg_temperature[bs] = torch.ones(bs, 1, dtype=torch.float32, device="cuda")
+            self._cg_top_k[bs] = torch.full((bs,), self.vocab_size, dtype=torch.int32, device="cuda")
+            self._cg_top_p[bs] = torch.ones(bs, dtype=torch.float32, device="cuda")
 
     def fill_cuda_graph_metadata(self, bucket_size, real_uuids):
         num_real = len(real_uuids)
@@ -193,6 +224,21 @@ class AutoKVCacheManager:
         self._cg_kv_indptr[bucket_size].copy_(torch.tensor(kv_indptr, dtype=torch.int32, device="cuda"))
         self._cg_kv_last_page_len[bucket_size].copy_(torch.tensor(kv_last_page_len, dtype=torch.int32, device="cuda"))
         self._cg_positions[bucket_size].copy_(torch.tensor(positions, dtype=torch.int32, device="cuda"))
+
+    def fill_cuda_graph_sampling_params(self, bucket_size, n, temperatures, top_ks, top_ps):
+        # Reset to safe defaults (padding won't affect real results)
+        self._cg_temperature[bucket_size].fill_(1.0)
+        self._cg_top_k[bucket_size].fill_(self.vocab_size)
+        self._cg_top_p[bucket_size].fill_(1.0)
+
+        # Write real values via pinned CPU
+        self.sampling_temperature_np[:n, 0] = temperatures
+        self.sampling_top_k_np[:n] = top_ks
+        self.sampling_top_p_np[:n] = top_ps
+
+        self._cg_temperature[bucket_size][:n].copy_(self.sampling_temperature_cpu[:n], non_blocking=True)
+        self._cg_top_k[bucket_size][:n].copy_(self.sampling_top_k_cpu[:n], non_blocking=True)
+        self._cg_top_p[bucket_size][:n].copy_(self.sampling_top_p_cpu[:n], non_blocking=True)
 
     def append_paged_kv_cache_cuda_graph(self, key, value, bucket_size, layer_idx):
         flashinfer.page.append_paged_kv_cache(
