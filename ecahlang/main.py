@@ -668,10 +668,11 @@ async def stream(inputs, created, form, request):
             if not form.ignore_eos and idx_next[0] in eos_token_id:
                 break
 
-            if args.torch_compile:
+            if args.torch_compile or args.cuda_graph:
                 """
                 I got weird overflow if not clone, like (tensor([5256919935786303302], device='cuda:0'),)
                 This will hit CUDA indexing assertion.
+                CUDA graph has the same issue: static output tensor gets overwritten on next replay.
                 """
                 idx_next = idx_next.clone()
 
