@@ -62,6 +62,15 @@ class AutoKVCacheManager:
         self.prefill_layer_idx = 0
         self.decode_layer_idx = 0
 
+        self.cuda_graph_mode = False
+        self.padding_pages = []
+        self._cg_kv_indices = {}
+        self._cg_kv_indptr = {}
+        self._cg_kv_last_page_len = {}
+        self._cg_batch_indices = {}
+        self._cg_positions = {}
+        self._cg_append_indptr = {}
+
     def allocate(self, batch_id, total_tokens):
         num_pages = math.ceil(total_tokens / self.block_size)
         if len(self.free_blocks) < num_pages:
@@ -142,3 +151,58 @@ class AutoKVCacheManager:
             self.batch_to_blocks[batch_id].append(new_page)
 
         self.batch_to_page_lengths[batch_id] = remaining
+
+    def init_cuda_graph_buffers(self, bucket_sizes):
+        max_bucket = max(bucket_sizes)
+
+        if len(self.free_blocks) < max_bucket:
+            raise RuntimeError(f"Not enough free blocks for {max_bucket} padding pages")
+        self.padding_pages = [self.free_blocks.pop() for _ in range(max_bucket)]
+
+        for bs in bucket_sizes:
+            self._cg_kv_indices[bs] = torch.zeros(self.max_blocks, dtype=torch.int32, device="cuda")
+            self._cg_kv_indptr[bs] = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+            self._cg_kv_last_page_len[bs] = torch.zeros(bs, dtype=torch.int32, device="cuda")
+            self._cg_batch_indices[bs] = torch.arange(bs, dtype=torch.int32, device="cuda")
+            self._cg_positions[bs] = torch.zeros(bs, dtype=torch.int32, device="cuda")
+            self._cg_append_indptr[bs] = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+
+    def fill_cuda_graph_metadata(self, bucket_size, real_uuids):
+        num_real = len(real_uuids)
+
+        kv_indices, kv_indptr, kv_last_page_len = [], [0], []
+        positions = []
+
+        for uid in real_uuids:
+            pages = self.batch_to_blocks[uid]
+            kv_indices.extend(pages)
+            kv_indptr.append(kv_indptr[-1] + len(pages))
+            kv_last_page_len.append(self.batch_to_page_lengths[uid])
+            total_tokens = (len(pages) - 1) * self.block_size + self.batch_to_page_lengths[uid]
+            positions.append(total_tokens - 1)
+
+        for i in range(bucket_size - num_real):
+            kv_indices.append(self.padding_pages[i])
+            kv_indptr.append(kv_indptr[-1] + 1)
+            kv_last_page_len.append(1)
+            positions.append(0)
+
+        kv_idx_t = torch.tensor(kv_indices, dtype=torch.int32, device="cuda")
+        n_idx = len(kv_indices)
+        self._cg_kv_indices[bucket_size][:n_idx].copy_(kv_idx_t)
+        self._cg_kv_indptr[bucket_size].copy_(torch.tensor(kv_indptr, dtype=torch.int32, device="cuda"))
+        self._cg_kv_last_page_len[bucket_size].copy_(torch.tensor(kv_last_page_len, dtype=torch.int32, device="cuda"))
+        self._cg_positions[bucket_size].copy_(torch.tensor(positions, dtype=torch.int32, device="cuda"))
+
+    def append_paged_kv_cache_cuda_graph(self, key, value, bucket_size, layer_idx):
+        flashinfer.page.append_paged_kv_cache(
+            append_key=key,
+            append_value=value,
+            batch_indices=self._cg_batch_indices[bucket_size],
+            positions=self._cg_positions[bucket_size],
+            paged_kv_cache=self.kv_cache[layer_idx],
+            kv_indices=self._cg_kv_indices[bucket_size],
+            kv_indptr=self._cg_kv_indptr[bucket_size],
+            kv_last_page_len=self._cg_kv_last_page_len[bucket_size],
+            kv_layout=self.layout,
+        )

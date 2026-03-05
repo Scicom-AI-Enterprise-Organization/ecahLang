@@ -88,6 +88,9 @@ def parse_arguments():
     if args.torch_compile and args.cuda_graph:
         raise ValueError('cannot set both torch compile and CUDA Graph')
 
+    if args.cuda_graph and args.multi_step > 1:
+        raise ValueError('CUDA graph does not support multi_step > 1')
+
     if args.torch_dtype not in {'float16', 'bfloat16', 'float32'}:
         raise ValueError('`--torch_dtype` only support `float16` or `bfloat16` or `float32`')
 

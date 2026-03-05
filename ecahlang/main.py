@@ -59,10 +59,14 @@ def ecah_attention(
     layer_attr = 'prefill_layer_idx' if prefill else 'decode_layer_idx'
     layer_idx = getattr(manager, layer_attr)
 
-    batch_attr = 'prefill_batch_ids' if prefill else 'decode_batch_ids'
-    batch_ids = getattr(manager, batch_attr)
+    if manager.cuda_graph_mode and not prefill:
+        bucket_size = query.shape[0]
+        manager.append_paged_kv_cache_cuda_graph(key, value, bucket_size, layer_idx)
+    else:
+        batch_attr = 'prefill_batch_ids' if prefill else 'decode_batch_ids'
+        batch_ids = getattr(manager, batch_attr)
+        manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, layer_idx)
 
-    manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, layer_idx)
     o = wrapper.run(query, manager.kv_cache[layer_idx])
 
     if args.compare_sdpa_prefill and prefill:
@@ -126,33 +130,66 @@ def load_model():
     )
 
 class CUDAGraphDecodeWrapper:
-    def __init__(self, decode_fn):
-        self.decode_fn = decode_fn
+    def __init__(self, decode_and_sample_fn):
+        self.fn = decode_and_sample_fn
         self.graphs = {}
         self.static_inputs = {}
         self.static_outputs = {}
 
-    def warmup(self, key, **inputs):
+    def warmup(self, bucket_size, capture_stream, **inputs):
         for k, v in inputs.items():
             inputs[k] = v.contiguous()
-        self.static_inputs[key] = {k: v.clone().cuda() for k, v in inputs.items()}
-        self.static_outputs[key] = {}
+        self.static_inputs[bucket_size] = {k: v.clone().cuda() for k, v in inputs.items()}
+
+        for _ in range(2):
+            self.fn(**self.static_inputs[bucket_size])
 
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            self.static_outputs[key] = self.decode_fn(**self.static_inputs[key])
-        self.graphs[key] = g
+        with torch.cuda.graph(g, stream=capture_stream):
+            out = self.fn(**self.static_inputs[bucket_size])
+        self.static_outputs[bucket_size] = out
+        self.graphs[bucket_size] = g
 
-    def run(self, key, **new_inputs):
-        for k in new_inputs:
-            if isinstance(new_inputs[k], torch.Tensor):
-                self.static_inputs[key][k].copy_(new_inputs[k])
-        self.graphs[key].replay()
-        return self.static_outputs[key]
+    def run(self, bucket_size, **new_inputs):
+        for k, v in new_inputs.items():
+            if isinstance(v, torch.Tensor):
+                self.static_inputs[bucket_size][k].copy_(v)
+        self.graphs[bucket_size].replay()
+        return self.static_outputs[bucket_size]
 
 def decode(*args, **kwargs):
     return model(*args, **kwargs)
+
+def decode_and_sample(input_ids, position_ids, append_indptr,
+                      mask_penalty, temperature, top_k, top_p):
+    output = decode(
+        input_ids=input_ids, position_ids=position_ids, use_cache=False,
+        wrapper=decode_wrapper, manager=manager, prefill=False, append_indptr=append_indptr,
+    )
+    logits = output.logits[0]
+    logits = logits / mask_penalty
+    logits = logits / temperature
+    idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, top_k=top_k, top_p=top_p, deterministic=True
+    )
+    return idx_next
+
+def get_bucket_sizes(max_sequence):
+    sizes = []
+    s = 1
+    while s <= max_sequence:
+        sizes.append(s)
+        s *= 2
+    if sizes[-1] < max_sequence:
+        sizes.append(max_sequence)
+    return sizes
+
+def next_bucket(n, bucket_sizes):
+    for bs in bucket_sizes:
+        if bs >= n:
+            return bs
+    return bucket_sizes[-1]
 
 tokenizer = None
 model = None
@@ -163,6 +200,8 @@ num_key_value_heads = None
 head_dim = None
 vocab_size = None
 eos_token_id = None
+cuda_graph_runner = None
+bucket_sizes = []
 AttentionInterface.register("ecah_attention", ecah_attention)
 workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
@@ -281,111 +320,98 @@ async def process_queue(queue, wrapper, prefill):
                     else:
                         manager.append_tokens(uuids[no], l)
 
-                input_ids = torch.concat(inputs)[None]
-                lengths = torch.concat([empty_length] + list(lengths))
-                append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
+                if args.cuda_graph and not prefill:
+                    # ====== CUDA GRAPH DECODE PATH ======
+                    n = len(uuids)
+                    bucket = next_bucket(n, bucket_sizes)
 
-                kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
-                if prefill:
-                    wrapper.plan(
-                        append_indptr,
-                        kv_indptr,
-                        kv_indices,
-                        kv_last_page_len,
-                        num_heads,
-                        num_key_value_heads,
-                        head_dim,
-                        manager.block_size,
-                        causal=True,
-                        q_data_type=args.torch_dtype,
+                    manager.fill_cuda_graph_metadata(bucket, uuids)
+
+                    decode_wrapper.plan(
+                        manager._cg_kv_indptr[bucket],
+                        manager._cg_kv_indices[bucket],
+                        manager._cg_kv_last_page_len[bucket],
+                        num_heads, num_key_value_heads, head_dim, manager.block_size,
+                        pos_encoding_mode="NONE", q_data_type=args.torch_dtype,
                     )
-                else:
-                    wrapper.plan(
-                        kv_indptr,
-                        kv_indices,
-                        kv_last_page_len,
-                        num_heads,
-                        num_key_value_heads,
-                        head_dim,
-                        manager.block_size,
-                        pos_encoding_mode="NONE",
-                        q_data_type=args.torch_dtype,
-                    )
-                setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
-                setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
-                forward = model if prefill else decode
+                    real_ids = torch.concat(inputs)
+                    padded_ids = torch.zeros(bucket, dtype=real_ids.dtype, device="cuda")
+                    padded_ids[:n] = real_ids
 
-                # Overlap: ensure fwd_stream waits for prior default-stream work (wrapper.plan)
-                fwd_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(fwd_stream):
-                    output = forward(
-                        input_ids=input_ids,
-                        position_ids=position_ids,
-                        use_cache=False,
-                        wrapper=wrapper,
-                        manager=manager,
-                        prefill=prefill,
-                        append_indptr=append_indptr,
-                    )
-                    logits = output.logits[0, append_indptr[1:] - 1]
-                    temperature_t = torch.concat(temperature)[None].T
-                    top_k_t = torch.concat(top_k)
-                    top_p_t = torch.concat(top_p)
+                    padded_pos = torch.zeros(bucket, dtype=torch.long, device="cuda")
+                    padded_pos[:n] = position_ids[0]
 
-                    mask_penalty = []
-                    for u in uuids:
-                        mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[u]])
-                    mask_penalty = torch.stack(mask_penalty)
+                    padded_mask = torch.ones(bucket, vocab_size, dtype=args.torch_dtype, device="cuda")
+                    for i, u in enumerate(uuids):
+                        padded_mask[i] = manager.mask_penalty[manager.batch_to_seq_len[u]]
 
-                    logits = logits / mask_penalty
-                    logits = logits / temperature_t
+                    padded_temp = torch.ones(bucket, 1, dtype=torch.float32, device="cuda")
+                    padded_temp[:n] = torch.concat(temperature)[None].T
+                    padded_top_k = torch.full((bucket,), vocab_size, dtype=torch.int32, device="cuda")
+                    padded_top_k[:n] = torch.concat(top_k)
+                    padded_top_p = torch.ones(bucket, dtype=torch.float32, device="cuda")
+                    padded_top_p[:n] = torch.concat(top_p)
 
-                    idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                        logits, top_k=top_k_t, top_p=top_p_t, deterministic=True,
-                    )[None].T
+                    manager.cuda_graph_mode = True
+                    manager.decode_layer_idx = 0
 
-                # Phase 2: yield to event loop while GPU still running
-                await asyncio.sleep(0)
+                    fwd_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(fwd_stream):
+                        idx_next_full = cuda_graph_runner.run(
+                            bucket,
+                            input_ids=padded_ids[None],
+                            position_ids=padded_pos[None],
+                            append_indptr=manager._cg_append_indptr[bucket],
+                            mask_penalty=padded_mask,
+                            temperature=padded_temp,
+                            top_k=padded_top_k,
+                            top_p=padded_top_p,
+                        )
 
-                # Phase 2: pre-collect next batch while GPU finishes
-                next_batch = []
-                while not queue.empty() and len(next_batch) < args.max_sequence:
-                    try:
-                        request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                        next_batch.append(request)
-                    except asyncio.TimeoutError:
-                        break
-                if not next_batch:
-                    next_batch = None
+                    manager.cuda_graph_mode = False
 
-                fwd_stream.synchronize()
-
-                # Phase 3: multi-step decode loop
-                num_steps = args.multi_step if not prefill else 1
-                if num_steps > 1:
-                    accumulated = [[(idx_next[i], None, idx_next[i][0] in eos_token_id)] for i in range(len(uuids))]
-                    active_mask = [not (idx_next[i][0] in eos_token_id) for i in range(len(uuids))]
-                    position_ids_track = [position_ids[0, i].item() + 1 for i in range(len(uuids))]
-
-                    # apply repetition penalty for step 0
-                    for i in range(len(uuids)):
-                        if rep_penalties[i] > 1:
-                            manager.mask_penalty[manager.batch_to_seq_len[uuids[i]], idx_next[i][0]] /= rep_penalties[i]
-
-                    for step in range(1, num_steps):
-                        active_indices = [i for i, a in enumerate(active_mask) if a]
-                        if not active_indices:
+                    await asyncio.sleep(0)
+                    next_batch = []
+                    while not queue.empty() and len(next_batch) < args.max_sequence:
+                        try:
+                            request = await asyncio.wait_for(queue.get(), timeout=1e-6)
+                            next_batch.append(request)
+                        except asyncio.TimeoutError:
                             break
+                    if not next_batch:
+                        next_batch = None
 
-                        step_input_ids = torch.stack([idx_next[i] for i in active_indices]).T  # [1, active_batch]
-                        step_position_ids = torch.tensor([position_ids_track[i] for i in active_indices])[None].cuda()
+                    fwd_stream.synchronize()
 
-                        for i in active_indices:
-                            manager.append_tokens(uuids[i], 1)
+                    idx_next = idx_next_full[:n].unsqueeze(1)
+                    loop = asyncio.get_running_loop()
+                    idx_next_cpu = idx_next.cpu()
+                    tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+                    for i, fut in enumerate(futures):
+                        fut.set_result((idx_next[i], tokens[i]))
 
-                        active_uuids = tuple(uuids[i] for i in active_indices)
-                        kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(active_uuids)
+                else:
+                    # ====== ORIGINAL PATH (prefill or non-cuda-graph decode) ======
+                    input_ids = torch.concat(inputs)[None]
+                    lengths = torch.concat([empty_length] + list(lengths))
+                    append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
+
+                    kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
+                    if prefill:
+                        wrapper.plan(
+                            append_indptr,
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_len,
+                            num_heads,
+                            num_key_value_heads,
+                            head_dim,
+                            manager.block_size,
+                            causal=True,
+                            q_data_type=args.torch_dtype,
+                        )
+                    else:
                         wrapper.plan(
                             kv_indptr,
                             kv_indices,
@@ -397,69 +423,155 @@ async def process_queue(queue, wrapper, prefill):
                             pos_encoding_mode="NONE",
                             q_data_type=args.torch_dtype,
                         )
+                    setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
+                    setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
-                        setattr(manager, "decode_layer_idx", 0)
-                        setattr(manager, "decode_batch_ids", active_uuids)
+                    forward = model if prefill else decode
 
-                        fwd_stream.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(fwd_stream):
-                            step_output = forward(
-                                input_ids=step_input_ids,
-                                position_ids=step_position_ids,
-                                use_cache=False,
-                                wrapper=wrapper,
-                                manager=manager,
-                                prefill=False,
-                                append_indptr=append_indptr[:len(active_indices) + 1] if len(active_indices) < len(uuids) else append_indptr,
-                            )
-                            step_logits = step_output.logits[0]
+                    # Overlap: ensure fwd_stream waits for prior default-stream work (wrapper.plan)
+                    fwd_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(fwd_stream):
+                        output = forward(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            wrapper=wrapper,
+                            manager=manager,
+                            prefill=prefill,
+                            append_indptr=append_indptr,
+                        )
+                        logits = output.logits[0, append_indptr[1:] - 1]
+                        temperature_t = torch.concat(temperature)[None].T
+                        top_k_t = torch.concat(top_k)
+                        top_p_t = torch.concat(top_p)
 
-                            step_mask_penalty = []
+                        mask_penalty = []
+                        for u in uuids:
+                            mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[u]])
+                        mask_penalty = torch.stack(mask_penalty)
+
+                        logits = logits / mask_penalty
+                        logits = logits / temperature_t
+
+                        idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                            logits, top_k=top_k_t, top_p=top_p_t, deterministic=True,
+                        )[None].T
+
+                    # Phase 2: yield to event loop while GPU still running
+                    await asyncio.sleep(0)
+
+                    # Phase 2: pre-collect next batch while GPU finishes
+                    next_batch = []
+                    while not queue.empty() and len(next_batch) < args.max_sequence:
+                        try:
+                            request = await asyncio.wait_for(queue.get(), timeout=1e-6)
+                            next_batch.append(request)
+                        except asyncio.TimeoutError:
+                            break
+                    if not next_batch:
+                        next_batch = None
+
+                    fwd_stream.synchronize()
+
+                    # Phase 3: multi-step decode loop
+                    num_steps = args.multi_step if not prefill else 1
+                    if num_steps > 1:
+                        accumulated = [[(idx_next[i], None, idx_next[i][0] in eos_token_id)] for i in range(len(uuids))]
+                        active_mask = [not (idx_next[i][0] in eos_token_id) for i in range(len(uuids))]
+                        position_ids_track = [position_ids[0, i].item() + 1 for i in range(len(uuids))]
+
+                        # apply repetition penalty for step 0
+                        for i in range(len(uuids)):
+                            if rep_penalties[i] > 1:
+                                manager.mask_penalty[manager.batch_to_seq_len[uuids[i]], idx_next[i][0]] /= rep_penalties[i]
+
+                        for step in range(1, num_steps):
+                            active_indices = [i for i, a in enumerate(active_mask) if a]
+                            if not active_indices:
+                                break
+
+                            step_input_ids = torch.stack([idx_next[i] for i in active_indices]).T  # [1, active_batch]
+                            step_position_ids = torch.tensor([position_ids_track[i] for i in active_indices])[None].cuda()
+
                             for i in active_indices:
-                                step_mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuids[i]]])
-                            step_mask_penalty = torch.stack(step_mask_penalty)
+                                manager.append_tokens(uuids[i], 1)
 
-                            step_temp = torch.stack([temperature[i] for i in active_indices])[None].T
-                            step_top_k = torch.stack([top_k[i] for i in active_indices])
-                            step_top_p = torch.stack([top_p[i] for i in active_indices])
+                            active_uuids = tuple(uuids[i] for i in active_indices)
+                            kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(active_uuids)
+                            wrapper.plan(
+                                kv_indptr,
+                                kv_indices,
+                                kv_last_page_len,
+                                num_heads,
+                                num_key_value_heads,
+                                head_dim,
+                                manager.block_size,
+                                pos_encoding_mode="NONE",
+                                q_data_type=args.torch_dtype,
+                            )
 
-                            step_logits = step_logits / step_mask_penalty
-                            step_logits = step_logits / step_temp
+                            setattr(manager, "decode_layer_idx", 0)
+                            setattr(manager, "decode_batch_ids", active_uuids)
 
-                            step_idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                                step_logits, top_k=step_top_k, top_p=step_top_p, deterministic=True,
-                            )[None].T
+                            fwd_stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(fwd_stream):
+                                step_output = forward(
+                                    input_ids=step_input_ids,
+                                    position_ids=step_position_ids,
+                                    use_cache=False,
+                                    wrapper=wrapper,
+                                    manager=manager,
+                                    prefill=False,
+                                    append_indptr=append_indptr[:len(active_indices) + 1] if len(active_indices) < len(uuids) else append_indptr,
+                                )
+                                step_logits = step_output.logits[0]
 
-                        fwd_stream.synchronize()
+                                step_mask_penalty = []
+                                for i in active_indices:
+                                    step_mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuids[i]]])
+                                step_mask_penalty = torch.stack(step_mask_penalty)
 
-                        # scatter back into idx_next and accumulate
-                        for local_idx, global_idx in enumerate(active_indices):
-                            token_id = step_idx_next[local_idx]
-                            hit_eos = token_id[0] in eos_token_id
-                            idx_next[global_idx] = token_id
-                            accumulated[global_idx].append((token_id, None, hit_eos))
-                            if hit_eos:
-                                active_mask[global_idx] = False
-                            if rep_penalties[global_idx] > 1:
-                                manager.mask_penalty[manager.batch_to_seq_len[uuids[global_idx]], token_id[0]] /= rep_penalties[global_idx]
-                            position_ids_track[global_idx] += 1
+                                step_temp = torch.stack([temperature[i] for i in active_indices])[None].T
+                                step_top_k = torch.stack([top_k[i] for i in active_indices])
+                                step_top_p = torch.stack([top_p[i] for i in active_indices])
 
-                if num_steps > 1:
-                    loop = asyncio.get_running_loop()
-                    for i in range(len(uuids)):
-                        all_token_ids = torch.stack([t[0] for t in accumulated[i]])
-                        decoded = await loop.run_in_executor(None, tokenizer.batch_decode, all_token_ids)
-                        result = [(accumulated[i][j][0], decoded[j], accumulated[i][j][2]) for j in range(len(accumulated[i]))]
-                        futures[i].set_result(result)
-                else:
-                    # Single step path (prefill or multi_step=1)
-                    # Phase 1: async detokenization
-                    loop = asyncio.get_running_loop()
-                    idx_next_cpu = idx_next.cpu()
-                    tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+                                step_logits = step_logits / step_mask_penalty
+                                step_logits = step_logits / step_temp
 
-                    for i, fut in enumerate(futures):
-                        fut.set_result((idx_next[i], tokens[i]))
+                                step_idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                    step_logits, top_k=step_top_k, top_p=step_top_p, deterministic=True,
+                                )[None].T
+
+                            fwd_stream.synchronize()
+
+                            # scatter back into idx_next and accumulate
+                            for local_idx, global_idx in enumerate(active_indices):
+                                token_id = step_idx_next[local_idx]
+                                hit_eos = token_id[0] in eos_token_id
+                                idx_next[global_idx] = token_id
+                                accumulated[global_idx].append((token_id, None, hit_eos))
+                                if hit_eos:
+                                    active_mask[global_idx] = False
+                                if rep_penalties[global_idx] > 1:
+                                    manager.mask_penalty[manager.batch_to_seq_len[uuids[global_idx]], token_id[0]] /= rep_penalties[global_idx]
+                                position_ids_track[global_idx] += 1
+
+                    if num_steps > 1:
+                        loop = asyncio.get_running_loop()
+                        for i in range(len(uuids)):
+                            all_token_ids = torch.stack([t[0] for t in accumulated[i]])
+                            decoded = await loop.run_in_executor(None, tokenizer.batch_decode, all_token_ids)
+                            result = [(accumulated[i][j][0], decoded[j], accumulated[i][j][2]) for j in range(len(accumulated[i]))]
+                            futures[i].set_result(result)
+                    else:
+                        # Single step path (prefill or multi_step=1)
+                        # Phase 1: async detokenization
+                        loop = asyncio.get_running_loop()
+                        idx_next_cpu = idx_next.cpu()
+                        tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+
+                        for i, fut in enumerate(futures):
+                            fut.set_result((idx_next[i], tokens[i]))
 
             except Exception as e:
                 for future in futures:
@@ -746,7 +858,59 @@ async def startup_event():
         r = await chat_completions_main(form=form, request=request)
         manager.free(request.state.request_id)
 
-    if args.torch_compile:
+    if args.cuda_graph:
+        global cuda_graph_runner, bucket_sizes
+
+        bucket_sizes = get_bucket_sizes(args.max_sequence)
+        logging.info(f'CUDA Graph bucket sizes: {bucket_sizes}')
+
+        manager.init_cuda_graph_buffers(bucket_sizes)
+
+        capture_stream = torch.cuda.Stream()
+        cuda_graph_runner = CUDAGraphDecodeWrapper(decode_and_sample)
+
+        for bs in tqdm(bucket_sizes, desc='warming up CUDA Graph'):
+            dummy_uuids = []
+            for k in range(bs):
+                uid = f'cg-warmup-{bs}-{k}'
+                dummy_uuids.append(uid)
+                manager.allocate(uid, 1)
+                manager.append_tokens(uid, 1)
+
+            manager.fill_cuda_graph_metadata(bs, tuple(dummy_uuids))
+
+            decode_wrapper.plan(
+                manager._cg_kv_indptr[bs],
+                manager._cg_kv_indices[bs],
+                manager._cg_kv_last_page_len[bs],
+                num_heads, num_key_value_heads, head_dim, manager.block_size,
+                pos_encoding_mode="NONE", q_data_type=args.torch_dtype,
+            )
+
+            manager.cuda_graph_mode = True
+            manager.decode_layer_idx = 0
+            manager.decode_batch_ids = tuple(dummy_uuids)
+
+            cuda_graph_runner.warmup(
+                bs,
+                capture_stream=capture_stream,
+                input_ids=torch.zeros(1, bs, dtype=torch.long, device="cuda"),
+                position_ids=torch.ones(1, bs, dtype=torch.long, device="cuda"),
+                append_indptr=manager._cg_append_indptr[bs],
+                mask_penalty=torch.ones(bs, vocab_size, dtype=args.torch_dtype, device="cuda"),
+                temperature=torch.ones(bs, 1, dtype=torch.float32, device="cuda"),
+                top_k=torch.full((bs,), vocab_size, dtype=torch.int32, device="cuda"),
+                top_p=torch.ones(bs, dtype=torch.float32, device="cuda"),
+            )
+
+            manager.cuda_graph_mode = False
+
+            for uid in dummy_uuids:
+                manager.free(uid)
+
+        logging.info('CUDA Graph warmup complete')
+
+    elif args.torch_compile:
         global decode
 
         decode = torch.compile(decode, mode=args.torch_compile_mode, dynamic=True)
