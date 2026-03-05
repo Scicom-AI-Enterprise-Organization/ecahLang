@@ -320,7 +320,7 @@ async def process_queue(queue, wrapper, prefill):
                     else:
                         manager.append_tokens(uuids[no], l)
 
-                if args.cuda_graph and not prefill:
+                if args.cuda_graph and not prefill and bucket_sizes:
                     # ====== CUDA GRAPH DECODE PATH ======
                     n = len(uuids)
                     bucket = next_bucket(n, bucket_sizes)
