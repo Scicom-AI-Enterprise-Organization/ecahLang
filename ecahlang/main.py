@@ -321,8 +321,8 @@ async def process_queue(queue, wrapper, prefill):
                     else:
                         manager.append_tokens(uuids[no], l)
 
-                if args.cuda_graph and not prefill and bucket_sizes:
-                    # ====== CUDA GRAPH DECODE PATH ======
+                if (args.cuda_graph or args.torch_compile) and not prefill and bucket_sizes:
+                    # ====== BUCKETED DECODE PATH (CUDA graph or torch_compile) ======
                     n = len(uuids)
                     bucket = next_bucket(n, bucket_sizes)
 
@@ -349,23 +349,40 @@ async def process_queue(queue, wrapper, prefill):
 
                     manager.fill_cuda_graph_sampling_params(bucket, n, temperature, top_k, top_p)
 
-                    manager.cuda_graph_mode = True
                     manager.decode_layer_idx = 0
 
-                    fwd_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(fwd_stream):
-                        idx_next_full = cuda_graph_runner.run(
-                            bucket,
-                            input_ids=padded_ids[None],
-                            position_ids=padded_pos[None],
-                            append_indptr=manager._cg_append_indptr[bucket],
-                            mask_penalty=padded_mask,
-                            temperature=manager._cg_temperature[bucket],
-                            top_k=manager._cg_top_k[bucket],
-                            top_p=manager._cg_top_p[bucket],
-                        )
+                    if args.cuda_graph:
+                        manager.cuda_graph_mode = True
 
-                    manager.cuda_graph_mode = False
+                        fwd_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(fwd_stream):
+                            idx_next_full = cuda_graph_runner.run(
+                                bucket,
+                                input_ids=padded_ids[None],
+                                position_ids=padded_pos[None],
+                                append_indptr=manager._cg_append_indptr[bucket],
+                                mask_penalty=padded_mask,
+                                temperature=manager._cg_temperature[bucket],
+                                top_k=manager._cg_top_k[bucket],
+                                top_p=manager._cg_top_p[bucket],
+                            )
+
+                        manager.cuda_graph_mode = False
+                    else:
+                        # torch_compile bucketed decode path
+                        manager.decode_batch_ids = tuple(list(uuids) + [uuids[0]] * (bucket - n))
+
+                        fwd_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(fwd_stream):
+                            idx_next_full = decode_and_sample(
+                                input_ids=padded_ids[None],
+                                position_ids=padded_pos[None],
+                                append_indptr=manager._cg_append_indptr[bucket],
+                                mask_penalty=padded_mask,
+                                temperature=manager._cg_temperature[bucket],
+                                top_k=manager._cg_top_k[bucket],
+                                top_p=manager._cg_top_p[bucket],
+                            )
 
                     await asyncio.sleep(0)
                     next_batch = []
@@ -907,21 +924,51 @@ async def startup_event():
         logging.info('CUDA Graph warmup complete')
 
     elif args.torch_compile:
-        global decode
+        global decode, decode_and_sample, bucket_sizes
 
-        decode = torch.compile(decode, mode=args.torch_compile_mode, dynamic=True)
-        for i in tqdm(range(args.max_sequence), desc='warming up torch compile'):
-            tasks = []
-            for k in range(i + 1):
-                request = Request(dummy_scope.copy(), receive=receive)
-                request.state.request_id = f'dummy-{k}'
-                task = asyncio.create_task(chat_completions_main(form=form, request=request))
-                tasks.append(task)
+        bucket_sizes = get_bucket_sizes(args.max_sequence)
+        logging.info(f'torch_compile bucket sizes: {bucket_sizes}')
 
-            await asyncio.gather(*tasks)
+        manager.init_cuda_graph_buffers(bucket_sizes)
 
-            for k in range(i + 1):
-                manager.free(f'dummy-{k}')
+        decode = torch.compile(decode, mode=args.torch_compile_mode, dynamic=False)
+        decode_and_sample = torch.compile(decode_and_sample, mode=args.torch_compile_mode, dynamic=False)
+
+        for bs in tqdm(bucket_sizes, desc='warming up torch compile'):
+            dummy_uuids = []
+            for k in range(bs):
+                uid = f'tc-warmup-{bs}-{k}'
+                dummy_uuids.append(uid)
+                manager.allocate(uid, 1)
+                manager.append_tokens(uid, 1)
+
+            manager.fill_cuda_graph_metadata(bs, tuple(dummy_uuids))
+
+            decode_wrapper.plan(
+                manager._cg_kv_indptr[bs],
+                manager._cg_kv_indices[bs],
+                manager._cg_kv_last_page_len[bs],
+                num_heads, num_key_value_heads, head_dim, manager.block_size,
+                pos_encoding_mode="NONE", q_data_type=args.torch_dtype,
+            )
+
+            manager.decode_layer_idx = 0
+            manager.decode_batch_ids = tuple(dummy_uuids)
+
+            decode_and_sample(
+                input_ids=torch.zeros(1, bs, dtype=torch.long, device="cuda"),
+                position_ids=torch.ones(1, bs, dtype=torch.long, device="cuda"),
+                append_indptr=manager._cg_append_indptr[bs],
+                mask_penalty=torch.ones(bs, vocab_size, dtype=args.torch_dtype, device="cuda"),
+                temperature=manager._cg_temperature[bs],
+                top_k=manager._cg_top_k[bs],
+                top_p=manager._cg_top_p[bs],
+            )
+
+            for uid in dummy_uuids:
+                manager.free(uid)
+
+        logging.info('torch compile warmup complete')
 
 if __name__ == "__main__":
     uvicorn.run(
