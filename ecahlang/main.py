@@ -161,8 +161,7 @@ class CUDAGraphDecodeWrapper:
 def decode(*args, **kwargs):
     return model(*args, **kwargs)
 
-def decode_and_sample(input_ids, position_ids, append_indptr,
-                      mask_penalty, temperature, top_k, top_p):
+def decode_forward(input_ids, position_ids, append_indptr, mask_penalty, temperature):
     manager.decode_layer_idx = 0
     output = decode(
         input_ids=input_ids, position_ids=position_ids, use_cache=False,
@@ -171,10 +170,7 @@ def decode_and_sample(input_ids, position_ids, append_indptr,
     logits = output.logits[0]
     logits = logits / mask_penalty
     logits = logits / temperature
-    idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, top_k=top_k, top_p=top_p, deterministic=True
-    )
-    return idx_next
+    return logits
 
 def get_bucket_sizes(max_sequence):
     sizes = []
@@ -356,15 +352,16 @@ async def process_queue(queue, wrapper, prefill):
 
                         fwd_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(fwd_stream):
-                            idx_next_full = cuda_graph_runner.run(
+                            logits = cuda_graph_runner.run(
                                 bucket,
                                 input_ids=padded_ids[None],
                                 position_ids=padded_pos[None],
                                 append_indptr=manager._cg_append_indptr[bucket],
                                 mask_penalty=padded_mask,
                                 temperature=manager._cg_temperature[bucket],
-                                top_k=manager._cg_top_k[bucket],
-                                top_p=manager._cg_top_p[bucket],
+                            )
+                            idx_next_full = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                logits, top_k=manager._cg_top_k[bucket], top_p=manager._cg_top_p[bucket], deterministic=True,
                             )
 
                         manager.cuda_graph_mode = False
@@ -848,7 +845,7 @@ async def chat_completions_main(form: ChatCompletionForm, request: Request = Non
 
 @app.on_event("startup")
 async def startup_event():
-    global decode, decode_and_sample, cuda_graph_runner, bucket_sizes
+    global decode, decode_forward, cuda_graph_runner, bucket_sizes
 
     load_model()
     manager.init_sampling_buffers(args.max_sequence)
@@ -886,7 +883,7 @@ async def startup_event():
         manager.init_cuda_graph_buffers(bucket_sizes)
 
         capture_stream = torch.cuda.Stream()
-        cuda_graph_runner = CUDAGraphDecodeWrapper(decode_and_sample)
+        cuda_graph_runner = CUDAGraphDecodeWrapper(decode_forward)
 
         for bs in tqdm(bucket_sizes, desc='warming up CUDA Graph'):
             dummy_uuids = []
@@ -918,8 +915,6 @@ async def startup_event():
                 append_indptr=manager._cg_append_indptr[bs],
                 mask_penalty=torch.ones(bs, vocab_size, dtype=args.torch_dtype, device="cuda"),
                 temperature=manager._cg_temperature[bs],
-                top_k=manager._cg_top_k[bs],
-                top_p=manager._cg_top_p[bs],
             )
 
             manager.cuda_graph_mode = False
