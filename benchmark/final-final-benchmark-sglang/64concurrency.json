@@ -1,0 +1,13 @@
+{
+    "concurrency": 64,
+    "successful_requests": 64,
+    "total_requests": 64,
+    "avg_ttft_s": 0.3764,
+    "avg_e2e_latency_s": 2.1166,
+    "avg_itl_ms": 4.5387,
+    "request_throughput_rps": 28.9028,
+    "output_token_throughput_tps": 11098.6827,
+    "total_tokens": 24576,
+    "avg_tokens_per_request": 384.0,
+    "bench_duration_s": 2.2143
+}

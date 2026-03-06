@@ -8,7 +8,7 @@ import os
 async def stress_test(index, url, model, max_tokens, timeout):
     json_data = {
         'model': model,
-        'prompt': 'Hello!'*200,
+        'prompt': 'Hello! '*200,
         'max_tokens': max_tokens,
         'stream': True,
         'ignore_eos': True,
