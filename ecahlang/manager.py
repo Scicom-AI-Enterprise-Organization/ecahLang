@@ -137,6 +137,33 @@ class AutoKVCacheManager:
             torch.tensor(kv_last_page_len, dtype=torch.int32, device="cuda"),
         )
     
+    def prepare_append_metadata(self, batch_ids, append_indptr):
+        """Pre-compute append metadata once per batch, reused across all layers."""
+        kv_indices, kv_indptr, kv_last_page_len = self.get_append_metadata(batch_ids)
+        seq_lens = flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, self.block_size)
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            append_indptr, seq_lens, append_indptr[-1]
+        )
+        self._cached_kv_indices = kv_indices
+        self._cached_kv_indptr = kv_indptr
+        self._cached_kv_last_page_len = kv_last_page_len
+        self._cached_batch_indices = batch_indices
+        self._cached_positions = positions
+
+    def append_paged_kv_cache_cached(self, key, value, layer_idx):
+        """Append using pre-computed metadata (call prepare_append_metadata first)."""
+        flashinfer.page.append_paged_kv_cache(
+            append_key=key,
+            append_value=value,
+            batch_indices=self._cached_batch_indices,
+            positions=self._cached_positions,
+            paged_kv_cache=self.kv_cache[layer_idx],
+            kv_indices=self._cached_kv_indices,
+            kv_indptr=self._cached_kv_indptr,
+            kv_last_page_len=self._cached_kv_last_page_len,
+            kv_layout=self.layout,
+        )
+
     def append_paged_kv_cache(self, batch_ids, key, value, append_indptr, layer_idx):
         kv_indices, kv_indptr, kv_last_page_len = self.get_append_metadata(batch_ids)
 

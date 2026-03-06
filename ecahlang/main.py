@@ -63,9 +63,7 @@ def ecah_attention(
         bucket_size = query.shape[0]
         manager.append_paged_kv_cache_cuda_graph(key, value, bucket_size, layer_idx)
     else:
-        batch_attr = 'prefill_batch_ids' if prefill else 'decode_batch_ids'
-        batch_ids = getattr(manager, batch_attr)
-        manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, layer_idx)
+        manager.append_paged_kv_cache_cached(key, value, layer_idx)
 
     o = wrapper.run(query, manager.kv_cache[layer_idx])
 
@@ -413,13 +411,13 @@ async def process_queue(queue, wrapper, prefill):
                     lengths = torch.tensor([0] + list(lengths), device="cuda")
                     append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
 
-                    kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
+                    manager.prepare_append_metadata(uuids, append_indptr)
                     if prefill:
                         wrapper.plan(
                             append_indptr,
-                            kv_indptr,
-                            kv_indices,
-                            kv_last_page_len,
+                            manager._cached_kv_indptr,
+                            manager._cached_kv_indices,
+                            manager._cached_kv_last_page_len,
                             num_heads,
                             num_key_value_heads,
                             head_dim,
@@ -429,9 +427,9 @@ async def process_queue(queue, wrapper, prefill):
                         )
                     else:
                         wrapper.plan(
-                            kv_indptr,
-                            kv_indices,
-                            kv_last_page_len,
+                            manager._cached_kv_indptr,
+                            manager._cached_kv_indices,
+                            manager._cached_kv_last_page_len,
                             num_heads,
                             num_key_value_heads,
                             head_dim,
@@ -516,11 +514,12 @@ async def process_queue(queue, wrapper, prefill):
                                 manager.append_tokens(uuids[i], 1)
 
                             active_uuids = tuple(uuids[i] for i in active_indices)
-                            kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(active_uuids)
+                            step_indptr = append_indptr[:len(active_indices) + 1]
+                            manager.prepare_append_metadata(active_uuids, step_indptr)
                             wrapper.plan(
-                                kv_indptr,
-                                kv_indices,
-                                kv_last_page_len,
+                                manager._cached_kv_indptr,
+                                manager._cached_kv_indices,
+                                manager._cached_kv_last_page_len,
                                 num_heads,
                                 num_key_value_heads,
                                 head_dim,
