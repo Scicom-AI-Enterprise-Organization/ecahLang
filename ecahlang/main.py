@@ -336,8 +336,8 @@ async def process_queue(queue, wrapper, prefill):
                         pos_encoding_mode="NONE", q_data_type=args.torch_dtype,
                     )
 
-                    real_ids = torch.concat(inputs)
-                    padded_ids = torch.zeros(bucket, dtype=real_ids.dtype, device="cuda")
+                    real_ids = torch.concat(inputs).to(torch.long)
+                    padded_ids = torch.zeros(bucket, dtype=torch.long, device="cuda")
                     padded_ids[:n] = real_ids
 
                     padded_pos = torch.zeros(bucket, dtype=torch.long, device="cuda")
