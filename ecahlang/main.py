@@ -374,14 +374,20 @@ async def process_queue(queue, wrapper, prefill):
 
                         fwd_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(fwd_stream):
-                            idx_next_full = decode_and_sample(
+                            output = decode(
                                 input_ids=padded_ids[None],
                                 position_ids=padded_pos[None],
+                                use_cache=False,
+                                wrapper=decode_wrapper,
+                                manager=manager,
+                                prefill=False,
                                 append_indptr=manager._cg_append_indptr[bucket],
-                                mask_penalty=padded_mask,
-                                temperature=manager._cg_temperature[bucket],
-                                top_k=manager._cg_top_k[bucket],
-                                top_p=manager._cg_top_p[bucket],
+                            )
+                            logits = output.logits[0]
+                            logits = logits / padded_mask
+                            logits = logits / manager._cg_temperature[bucket]
+                            idx_next_full = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                logits, top_k=manager._cg_top_k[bucket], top_p=manager._cg_top_p[bucket], deterministic=True,
                             )
 
                     await asyncio.sleep(0)
@@ -930,7 +936,6 @@ async def startup_event():
         manager.init_cuda_graph_buffers(bucket_sizes)
 
         decode = torch.compile(decode, mode=args.torch_compile_mode, dynamic=False)
-        decode_and_sample = torch.compile(decode_and_sample, mode=args.torch_compile_mode, dynamic=False)
 
         for bs in tqdm(bucket_sizes, desc='warming up torch compile'):
             dummy_uuids = []
@@ -953,14 +958,14 @@ async def startup_event():
             manager.decode_layer_idx = 0
             manager.decode_batch_ids = tuple(dummy_uuids)
 
-            decode_and_sample(
+            decode(
                 input_ids=torch.zeros(1, bs, dtype=torch.long, device="cuda"),
                 position_ids=torch.ones(1, bs, dtype=torch.long, device="cuda"),
+                use_cache=False,
+                wrapper=decode_wrapper,
+                manager=manager,
+                prefill=False,
                 append_indptr=manager._cg_append_indptr[bs],
-                mask_penalty=torch.ones(bs, vocab_size, dtype=args.torch_dtype, device="cuda"),
-                temperature=manager._cg_temperature[bs],
-                top_k=manager._cg_top_k[bs],
-                top_p=manager._cg_top_p[bs],
             )
 
             for uid in dummy_uuids:
