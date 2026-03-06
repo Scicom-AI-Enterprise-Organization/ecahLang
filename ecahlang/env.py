@@ -82,6 +82,11 @@ def parse_arguments():
         '--multi_step', default=int(os.environ.get('MULTI_STEP', '1')), type=int,
         help='Number of decode steps to run per round-trip (default: %(default)s, env: MULTI_STEP)'
     )
+    parser.add_argument(
+        '--max_prefill_tokens', type=int,
+        default=int(os.environ.get('MAX_PREFILL_TOKENS', '2048')),
+        help='Max total tokens per prefill batch for chunked prefill, 0 to disable (default: %(default)s, env: MAX_PREFILL_TOKENS)'
+    )
 
     args = parser.parse_args()
 

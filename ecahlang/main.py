@@ -296,6 +296,22 @@ async def process_queue(queue, wrapper, prefill):
         if not len(batch):
             continue
 
+        # Chunked prefill: split batch if total tokens exceed budget
+        if prefill and args.max_prefill_tokens > 0:
+            chunked = []
+            token_count = 0
+            for i, req in enumerate(batch):
+                req_tokens = req[1].shape[0]
+                if chunked and token_count + req_tokens > args.max_prefill_tokens:
+                    next_batch = batch[i:]
+                    need_sleep = False
+                    batch = chunked
+                    break
+                chunked.append(req)
+                token_count += req_tokens
+            else:
+                batch = chunked
+
         with profiler as prof:
             futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
             temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
@@ -478,15 +494,18 @@ async def process_queue(queue, wrapper, prefill):
                     await asyncio.sleep(0)
 
                     # Phase 2: pre-collect next batch while GPU finishes
-                    next_batch = []
-                    while not queue.empty() and len(next_batch) < args.max_sequence:
+                    pre_collected = []
+                    while not queue.empty() and len(pre_collected) < args.max_sequence:
                         try:
                             request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                            next_batch.append(request)
+                            pre_collected.append(request)
                         except asyncio.TimeoutError:
                             break
-                    if not next_batch:
-                        next_batch = None
+                    if pre_collected:
+                        if next_batch is not None:
+                            next_batch.extend(pre_collected)
+                        else:
+                            next_batch = pre_collected
 
                     fwd_stream.synchronize()
 
