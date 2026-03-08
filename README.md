@@ -1,34 +1,62 @@
 # ecahLang
 
-Simple continuous batching CausalLM from HuggingFace Transformer using FlashInfer.
+Lightweight continuous batching inference engine for HuggingFace CausalLM models, built on [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
 
-1. Simple paged KV cache manager.
-2. Radix tree KV cache manager with prefix sharing.
-3. Torch compile support.
-4. FP32 support but downcast and upcast attention forward.
-5. Support top-k, top-p, temperature and repetition penalty for sampling.
-6. Background detokenizer (threaded).
-7. CUDA stream overlap for compute/communication.
-8. Modular architecture inspired by vLLM and SGLang.
+## Features
 
-## How to install
+- Continuous batching with paged KV cache
+- FlashInfer paged prefill and decode attention
+- CUDA Graph decode
+- torch.compile decode
+- CUDA stream overlap schedule
+- Pre-allocated pinned sampling buffers
 
-Using uv,
+## Pre-requisites
 
 ```bash
-uv pip install git+https://github.com/Scicom-AI-Enterprise-Organization/ecahLang
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv --python 3.12
+source .venv/bin/activate
 ```
 
-Or you can git clone and install,
+## Installation
+
+```bash
+pip install git+https://github.com/Scicom-AI-Enterprise-Organization/ecahLang
+```
+
+Or from source:
 
 ```bash
 git clone https://github.com/Scicom-AI-Enterprise-Organization/ecahLang && cd ecahLang
-uv pip install -e .
+pip install -e .
 ```
 
-## How to local
+## Quick Start
 
-### Supported parameters
+Run ecahLang with CUDA Graph enabled for the best decode performance. The server will warm up FlashInfer and capture decode graphs at startup, then serve requests on an OpenAI-compatible API.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m ecahlang \
+  --model Qwen/Qwen2.5-3B-Instruct \
+  --torch_dtype float16 \
+  --host 0.0.0.0 --port 7088 \
+  --memory_utilization 0.5 \
+  --cuda_graph true
+```
+
+```bash
+curl -X POST http://localhost:7088/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+## Supported Parameters
 
 ```bash
 python3 -m ecahlang --help
@@ -71,83 +99,55 @@ options:
                         capture CUDA Graph for decode (default: False, env: CUDA_GRAPH)
 ```
 
-**We support both args and OS environment**.
+**We support both args and OS environment.**
 
-### Run meta-llama/Llama-3.2-1B-Instruct
+## Benchmarks
 
-```bash
-python3 -m ecahlang \
---host 0.0.0.0 --port 7088 --model meta-llama/Llama-3.2-1B-Instruct
-```
+Benchmarked on **Qwen/Qwen2.5-3B-Instruct** (float16) across concurrency levels 1–128, compared against baseline (no optimizations), SGLang, and vLLM. Each request generates 384 tokens with `ignore_eos: true`.
 
-```bash
-curl -X 'POST' \
-  'http://localhost:7088/chat/completions' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "model": "model",
-  "temperature": 0.9,
-  "top_p": 0,
-  "top_k": 0,
-  "max_tokens": 256,
-  "repetition_penalty": 1,
-  "messages": [
-    {
-      "role": "user",
-      "content": "Hello!"
-    }
-  ],
-  "stream": true
-}'
-```
+### Time to First Token (TTFT)
 
-### Torch compile
+![TTFT vs Concurrency](pics/ttft-graph.png)
+
+### Inter-Token Latency (ITL)
+
+![ITL vs Concurrency](pics/itl-graph.png)
+
+### End-to-End Latency (E2E)
+
+![E2E vs Concurrency](pics/e2e-graph.png)
+
+### Running the Benchmark
 
 ```bash
-python3 -m ecahlang \
---host 0.0.0.0 --port 7088 --model meta-llama/Llama-3.2-1B-Instruct \
---torch_compile true
+# Against ecahLang
+python3 benchmark/benchmark.py \
+  --model Qwen/Qwen2.5-3B-Instruct \
+  --save benchmark/my-results \
+  --concurrency-list 1,2,4,8,16,32,64,128
+
+# Against vLLM/SGLang (uses /v1/completions)
+python3 benchmark/benchmark.py \
+  --model Qwen/Qwen2.5-3B-Instruct \
+  --save benchmark/vllm-results \
+  --vllm \
+  --concurrency-list 1,2,4,8,16,32,64,128
 ```
 
-#### Reduce overhead
+Visualization notebook: [`benchmark/benchmark_visualization.ipynb`](benchmark/benchmark_visualization.ipynb)
 
-```bash
-python3 -m ecahlang \
---host 0.0.0.0 --port 7088 --model meta-llama/Llama-3.2-1B-Instruct \
---torch_compile true --torch_compile_mode reduce-overhead --max_sequence 10
-```
-
-#### Max autotune
-
-```bash
-python3 -m ecahlang \
---host 0.0.0.0 --port 7088 --model meta-llama/Llama-3.2-1B-Instruct \
---torch_compile true --torch_compile_mode max-autotune --max_sequence 10
-```
-
-## Architecture
+## Project Structure
 
 ```
 ecahlang/
-├── server_args.py                 # CLI args + env var config
-├── entrypoints/                   # API layer (vLLM pattern)
-│   ├── api_server.py              # FastAPI app, startup/shutdown
-│   ├── protocol.py                # Pydantic request/response models
-│   └── streaming.py               # SSE streaming, per-request coroutine
-├── core/                          # Scheduler (vLLM v1/core pattern)
-│   ├── scheduler.py               # Queue management, batch formation
-│   └── request_state.py           # Per-request state tracking
-├── mem/                           # KV cache management (SGLang mem_cache pattern)
-│   ├── paged_kv_manager.py        # Paged KV cache with free-list
-│   └── radix_kv_manager.py        # Radix tree with prefix sharing
-├── model_executor/                # GPU execution (vLLM + SGLang pattern)
-│   ├── model_runner.py            # Load HF model, forward pass
-│   ├── attention.py               # FlashInfer attention hook
-│   └── cuda_graph_runner.py       # CUDA graph capture/replay
-├── sampling/                      # Sampling (SGLang pattern)
-│   └── sampler.py                 # top-k, top-p, temperature, repetition penalty
-└── managers/                      # Background managers (SGLang pattern)
-    ├── detokenizer.py             # Background batch_decode in thread pool
-    └── overlap.py                 # CUDA stream overlap
+├── env.py          # CLI args + environment variable config
+├── main.py         # FastAPI app, process_queue, stream, startup
+├── manager.py      # Paged KV cache manager + sampling buffers
+├── parameters.py   # Pydantic request/response models
+└── utils.py        # Attention mask utilities
+benchmark/
+├── benchmark.py                 # Stress test script
+├── benchmark_visualization.ipynb # Visualization notebook
+└── <results>/                   # JSON results per concurrency level
+pics/                            # Benchmark graphs
 ```
