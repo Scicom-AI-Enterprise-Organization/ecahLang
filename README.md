@@ -107,15 +107,15 @@ Benchmarked on **Qwen/Qwen2.5-3B-Instruct** (float16) across concurrency levels 
 
 ### Time to First Token (TTFT)
 
-![TTFT vs Concurrency](pics/ttft-graph.png)
+![TTFT vs Concurrency](pics/ttft-graph-2.png)
 
 ### Inter-Token Latency (ITL)
 
-![ITL vs Concurrency](pics/itl-graph.png)
+![ITL vs Concurrency](pics/itl-graph-2.png)
 
 ### End-to-End Latency (E2E)
 
-![E2E vs Concurrency](pics/e2e-graph.png)
+![E2E vs Concurrency](pics/e2e-graph-2.png)
 
 ### Running the Benchmark
 
