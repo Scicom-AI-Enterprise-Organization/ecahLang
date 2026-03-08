@@ -10,6 +10,7 @@ Lightweight continuous batching inference engine for HuggingFace CausalLM models
 - torch.compile decode
 - CUDA stream overlap schedule
 - Pre-allocated pinned sampling buffers
+- Chunked prefill
 
 ## Pre-requisites
 
