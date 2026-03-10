@@ -87,6 +87,18 @@ def parse_arguments():
         default=int(os.environ.get('MAX_PREFILL_TOKENS', '2048')),
         help='Max total tokens per prefill batch for chunked prefill, 0 to disable (default: %(default)s, env: MAX_PREFILL_TOKENS)'
     )
+    parser.add_argument(
+        '--skip_batch_decode',
+        type=lambda x: x.lower() == 'true',
+        default=os.environ.get('SKIP_BATCH_DECODE', 'false').lower() == 'true',
+        help='Call tokenizer.batch_decode synchronously instead of via run_in_executor, useful for throughput benchmarking (default: %(default)s, env: SKIP_BATCH_DECODE)'
+    )
+    parser.add_argument(
+        '--overlap_logging',
+        type=lambda x: x.lower() == 'true',
+        default=os.environ.get('OVERLAP_LOGGING', 'false').lower() == 'true',
+        help='Enable communication/computation overlap timing logs into timing_logs global (introduces latency, disabled by default) (default: %(default)s, env: OVERLAP_LOGGING)'
+    )
 
     args = parser.parse_args()
 

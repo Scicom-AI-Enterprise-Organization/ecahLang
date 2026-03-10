@@ -22,6 +22,14 @@ import uuid
 import traceback
 import os
 
+# Global timing accumulators for overlap benchmarking (decode path)
+timing_logs = {
+    'gpu_launch_ms': [],       # time to launch GPU kernels (non-blocking)
+    'cpu_overlap_ms': [],      # CPU work (queue drain) while GPU runs
+    'gpu_sync_wait_ms': [],    # time blocked in fwd_stream.synchronize()
+    'batch_decode_ms': [],     # tokenizer.batch_decode wall time
+}
+
 @torch.compiler.disable
 def ecah_attention(
     module,
@@ -365,6 +373,8 @@ async def process_queue(queue, wrapper, prefill):
                         manager.cuda_graph_mode = True
 
                         fwd_stream.wait_stream(torch.cuda.current_stream())
+                        if args.overlap_logging:
+                            _t0 = time.perf_counter()
                         with torch.cuda.stream(fwd_stream):
                             logits = cuda_graph_runner.run(
                                 bucket,
@@ -377,6 +387,8 @@ async def process_queue(queue, wrapper, prefill):
                             idx_next_full = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                                 logits, top_k=manager._cg_top_k[bucket], top_p=manager._cg_top_p[bucket], deterministic=True,
                             )
+                        if args.overlap_logging:
+                            timing_logs['gpu_launch_ms'].append((time.perf_counter() - _t0) * 1000)
 
                         manager.cuda_graph_mode = False
                     else:
@@ -384,6 +396,8 @@ async def process_queue(queue, wrapper, prefill):
                         manager.decode_batch_ids = tuple(list(uuids) + [uuids[0]] * (bucket - n))
 
                         fwd_stream.wait_stream(torch.cuda.current_stream())
+                        if args.overlap_logging:
+                            _t0 = time.perf_counter()
                         with torch.cuda.stream(fwd_stream):
                             output = decode(
                                 input_ids=padded_ids[None],
@@ -400,8 +414,12 @@ async def process_queue(queue, wrapper, prefill):
                             idx_next_full = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                                 logits, top_k=manager._cg_top_k[bucket], top_p=manager._cg_top_p[bucket], deterministic=True,
                             )
+                        if args.overlap_logging:
+                            timing_logs['gpu_launch_ms'].append((time.perf_counter() - _t0) * 1000)
 
                     await asyncio.sleep(0)
+                    if args.overlap_logging:
+                        _t2 = time.perf_counter()
                     next_batch = []
                     while not queue.empty() and len(next_batch) < args.max_sequence:
                         try:
@@ -411,13 +429,25 @@ async def process_queue(queue, wrapper, prefill):
                             break
                     if not next_batch:
                         next_batch = None
+                    if args.overlap_logging:
+                        _t3 = time.perf_counter()
+                        timing_logs['cpu_overlap_ms'].append((_t3 - _t2) * 1000)
 
                     fwd_stream.synchronize()
+                    if args.overlap_logging:
+                        _t4 = time.perf_counter()
+                        timing_logs['gpu_sync_wait_ms'].append((_t4 - _t3) * 1000)
 
                     idx_next = idx_next_full[:n].unsqueeze(1)
-                    loop = asyncio.get_running_loop()
                     idx_next_cpu = idx_next.cpu()
-                    tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+                    if args.skip_batch_decode:
+                        tokens = tokenizer.batch_decode(idx_next_cpu)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+                    if args.overlap_logging:
+                        timing_logs['batch_decode_ms'].append((time.perf_counter() - _t4) * 1000)
+
                     for i, fut in enumerate(futures):
                         fut.set_result((idx_next[i], tokens[i]))
 
@@ -598,18 +628,24 @@ async def process_queue(queue, wrapper, prefill):
                                 position_ids_track[global_idx] += 1
 
                     if num_steps > 1:
-                        loop = asyncio.get_running_loop()
                         for i in range(len(uuids)):
                             all_token_ids = torch.stack([t[0] for t in accumulated[i]])
-                            decoded = await loop.run_in_executor(None, tokenizer.batch_decode, all_token_ids)
+                            if args.skip_batch_decode:
+                                decoded = tokenizer.batch_decode(all_token_ids)
+                            else:
+                                loop = asyncio.get_running_loop()
+                                decoded = await loop.run_in_executor(None, tokenizer.batch_decode, all_token_ids)
                             result = [(accumulated[i][j][0], decoded[j], accumulated[i][j][2]) for j in range(len(accumulated[i]))]
                             futures[i].set_result(result)
                     else:
                         # Single step path (prefill or multi_step=1)
                         # Phase 1: async detokenization
-                        loop = asyncio.get_running_loop()
                         idx_next_cpu = idx_next.cpu()
-                        tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
+                        if args.skip_batch_decode:
+                            tokens = [''] * len(idx_next_cpu)
+                        else:
+                            loop = asyncio.get_running_loop()
+                            tokens = await loop.run_in_executor(None, tokenizer.batch_decode, idx_next_cpu)
 
                         for i, fut in enumerate(futures):
                             fut.set_result((idx_next[i], tokens[i]))

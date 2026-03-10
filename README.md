@@ -1,6 +1,6 @@
 # ecahLang
 
-Lightweight continuous batching inference engine for HuggingFace CausalLM models, built on [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
+Lightweight continuous batching inference engine for HuggingFace CausalLM models, built on top of [FlashInfer](https://github.com/flashinfer-ai/flashinfer). The name "ecah" is inspired by Aisyah, a lovely and popular Malaysian girl's name, a short and friendly nickname.
 
 ## Features
 
