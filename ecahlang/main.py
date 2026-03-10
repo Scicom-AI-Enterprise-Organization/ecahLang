@@ -278,7 +278,6 @@ async def add_request_id_and_time(request: Request, call_next):
 async def process_queue(queue, wrapper, prefill):
     fwd_stream = torch.cuda.Stream()
     global_step = 0
-    need_sleep = True
     next_batch = None  # Phase 2: pre-collected batch buffer
 
     while True:
@@ -287,22 +286,14 @@ async def process_queue(queue, wrapper, prefill):
             batch = next_batch
             next_batch = None
         else:
-            if need_sleep:
-                await asyncio.sleep(args.microsleep)
-            need_sleep = True
-            batch = []
-            while not queue.empty():
+            # Block until at least one request arrives, then drain the rest
+            batch = [await queue.get()]
+            while not queue.empty() and len(batch) < args.max_sequence:
                 try:
                     request = await asyncio.wait_for(queue.get(), timeout=1e-6)
                     batch.append(request)
-                    if len(batch) >= args.max_sequence:
-                        need_sleep = False
-                        break
                 except asyncio.TimeoutError:
                     break
-
-        if not len(batch):
-            continue
 
         # Chunked prefill: split batch if total tokens exceed budget
         if prefill and args.max_prefill_tokens > 0:

@@ -21,11 +21,6 @@ def parse_arguments():
         help='Logging level (default: %(default)s, env: LOGLEVEL)'
     )
     parser.add_argument(
-        '--microsleep', type=float,
-        default=float(os.environ.get('MICROSLEEP', '1e-4')),
-        help='microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: %(default)s, env: MICROSLEEP)'
-    )
-    parser.add_argument(
         '--max_sequence', type=int,
         default=int(os.environ.get('MAX_SEQUENCE', '128')),
         help='max sequence aka batch size per filling or decoding (default: %(default)s, env: MAX_SEQUENCE)'
