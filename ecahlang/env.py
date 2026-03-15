@@ -89,6 +89,11 @@ def parse_arguments():
         help='Call tokenizer.batch_decode synchronously instead of via run_in_executor, useful for throughput benchmarking (default: %(default)s, env: SKIP_BATCH_DECODE)'
     )
     parser.add_argument(
+        '--block_size', type=int,
+        default=int(os.environ.get('BLOCK_SIZE', '16')),
+        help='KV cache page block size in tokens (default: %(default)s, env: BLOCK_SIZE)'
+    )
+    parser.add_argument(
         '--overlap_logging',
         type=lambda x: x.lower() == 'true',
         default=os.environ.get('OVERLAP_LOGGING', 'false').lower() == 'true',

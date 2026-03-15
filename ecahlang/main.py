@@ -133,6 +133,7 @@ def load_model():
         mem_utilization=args.memory_utilization,
         vocab_size=vocab_size,
         seq_lens=args.max_sequence,
+        block_size=args.block_size,
     )
 
 class CUDAGraphDecodeWrapper:
@@ -288,11 +289,10 @@ async def process_queue(queue, wrapper, prefill):
         else:
             # Block until at least one request arrives, then drain the rest
             batch = [await queue.get()]
-            while not queue.empty() and len(batch) < args.max_sequence:
+            while len(batch) < args.max_sequence:
                 try:
-                    request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                    batch.append(request)
-                except asyncio.TimeoutError:
+                    batch.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
                     break
 
         # Chunked prefill: split batch if total tokens exceed budget
@@ -353,8 +353,7 @@ async def process_queue(queue, wrapper, prefill):
                     padded_pos[:n] = position_ids[0]
 
                     padded_mask = torch.ones(bucket, vocab_size, dtype=args.torch_dtype, device="cuda")
-                    for i, u in enumerate(uuids):
-                        padded_mask[i] = manager.mask_penalty[manager.batch_to_seq_len[u]]
+                    padded_mask[:n] = manager.mask_penalty[[manager.batch_to_seq_len[u] for u in uuids]]
 
                     manager.fill_cuda_graph_sampling_params(bucket, n, temperature, top_k, top_p)
 
@@ -412,11 +411,10 @@ async def process_queue(queue, wrapper, prefill):
                     if args.overlap_logging:
                         _t2 = time.perf_counter()
                     next_batch = []
-                    while not queue.empty() and len(next_batch) < args.max_sequence:
+                    while len(next_batch) < args.max_sequence:
                         try:
-                            request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                            next_batch.append(request)
-                        except asyncio.TimeoutError:
+                            next_batch.append(queue.get_nowait())
+                        except asyncio.QueueEmpty:
                             break
                     if not next_batch:
                         next_batch = None
@@ -499,10 +497,7 @@ async def process_queue(queue, wrapper, prefill):
                         top_k_t = manager.sampling_top_k_gpu[:n]
                         top_p_t = manager.sampling_top_p_gpu[:n]
 
-                        mask_penalty = []
-                        for u in uuids:
-                            mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[u]])
-                        mask_penalty = torch.stack(mask_penalty)
+                        mask_penalty = manager.mask_penalty[[manager.batch_to_seq_len[u] for u in uuids]]
 
                         logits = logits / mask_penalty
                         logits = logits / temperature_t
@@ -516,11 +511,10 @@ async def process_queue(queue, wrapper, prefill):
 
                     # Phase 2: pre-collect next batch while GPU finishes
                     pre_collected = []
-                    while not queue.empty() and len(pre_collected) < args.max_sequence:
+                    while len(pre_collected) < args.max_sequence:
                         try:
-                            request = await asyncio.wait_for(queue.get(), timeout=1e-6)
-                            pre_collected.append(request)
-                        except asyncio.TimeoutError:
+                            pre_collected.append(queue.get_nowait())
+                        except asyncio.QueueEmpty:
                             break
                     if pre_collected:
                         if next_batch is not None:
@@ -584,10 +578,7 @@ async def process_queue(queue, wrapper, prefill):
                                 )
                                 step_logits = step_output.logits[0]
 
-                                step_mask_penalty = []
-                                for i in active_indices:
-                                    step_mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuids[i]]])
-                                step_mask_penalty = torch.stack(step_mask_penalty)
+                                step_mask_penalty = manager.mask_penalty[[manager.batch_to_seq_len[uuids[i]] for i in active_indices]]
 
                                 active_temps = [temperature[i] for i in active_indices]
                                 active_top_ks = [top_k[i] for i in active_indices]
@@ -780,7 +771,7 @@ async def handle_stream_response(func, created, request_id, stream_type="complet
                         }
                     ],
                     'created': created,
-                    'model': 'model',
+                    'model': args.model,
                     'object': 'chat.completion.chunk',
                     'system_fingerprint': None
                 }
@@ -796,7 +787,7 @@ async def handle_stream_response(func, created, request_id, stream_type="complet
                         }
                     ],
                     'created': created,
-                    'model': 'model',
+                    'model': args.model,
                     'object': 'text_completion',
                     'system_fingerprint': None
                 }
@@ -814,7 +805,7 @@ async def handle_non_stream_response(func, inputs, created, request_id, stream_t
     base = {
         'id': request_id,
         'created': created,
-        'model': 'model',
+        'model': args.model,
         'system_fingerprint': None,
         'usage': {
             'completion_tokens': len(tokens),
@@ -1012,13 +1003,3 @@ async def startup_event():
                 manager.free(uid)
 
         logging.info('torch compile warmup complete')
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level=args.loglevel.lower(),
-        access_log=True,
-        loop="uvloop",
-    )

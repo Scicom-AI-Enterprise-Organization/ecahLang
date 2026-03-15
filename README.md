@@ -64,47 +64,58 @@ python3 -m ecahlang --help
 ```
 
 ```text
-usage: __main__.py [-h] [--host HOST] [--port PORT] [--loglevel LOGLEVEL] [--microsleep MICROSLEEP]
-               [--max_sequence MAX_SEQUENCE] [--memory_utilization MEMORY_UTILIZATION]
-               [--compare-sdpa-prefill COMPARE_SDPA_PREFILL] [--model MODEL] [--torch_dtype TORCH_DTYPE]
-               [--torch_dtype_autocast TORCH_DTYPE_AUTOCAST] [--torch_profiling TORCH_PROFILING]
-               [--torch_compile TORCH_COMPILE] [--torch_compile_mode TORCH_COMPILE_MODE] [--cuda_graph CUDA_GRAPH]
+usage: __main__.py [-h] [--host HOST] [--port PORT] [--loglevel LOGLEVEL] [--max_sequence MAX_SEQUENCE] [--memory_utilization MEMORY_UTILIZATION]
+                   [--compare-sdpa-prefill COMPARE_SDPA_PREFILL] [--model MODEL] [--torch_dtype TORCH_DTYPE] [--torch_dtype_autocast TORCH_DTYPE_AUTOCAST]
+                   [--torch_profiling TORCH_PROFILING] [--torch_compile TORCH_COMPILE] [--torch_compile_mode TORCH_COMPILE_MODE] [--cuda_graph CUDA_GRAPH]
+                   [--multi_step MULTI_STEP] [--max_prefill_tokens MAX_PREFILL_TOKENS] [--skip_batch_decode SKIP_BATCH_DECODE] [--block_size BLOCK_SIZE]
+                   [--overlap_logging OVERLAP_LOGGING]
 
-ecahLang - Continuous Batching LLM Inference
+Configuration parser
 
 options:
   -h, --help            show this help message and exit
   --host HOST           host name to host the app (default: 0.0.0.0, env: HOSTNAME)
   --port PORT           port to host the app (default: 7088, env: PORT)
   --loglevel LOGLEVEL   Logging level (default: INFO, env: LOGLEVEL)
-  --microsleep MICROSLEEP
-                        microsleep to group batching, 1 / 1e-4 = 10k steps/sec (default: 0.0001, env: MICROSLEEP)
   --max_sequence MAX_SEQUENCE
-                        max batch size per prefill or decode step (default: 128, env: MAX_SEQUENCE)
+                        max sequence aka batch size per filling or decoding (default: 128, env: MAX_SEQUENCE)
   --memory_utilization MEMORY_UTILIZATION
-                        fraction of free GPU memory for KV cache pages (default: 0.9, env: MEMORY_UTILIZATION)
+                        memory utilization on free memory after load the model for automatic number of paging for paged attention (default: 0.9, env:
+                        MEMORY_UTILIZATION)
   --compare-sdpa-prefill COMPARE_SDPA_PREFILL
-                        compare FlashInfer attention output with SDPA during prefill (default: False, env: COMPARE_SDPA_PREFILL)
-  --model MODEL         HuggingFace model name or path (default: meta-llama/Llama-3.2-1B-Instruct, env: MODEL)
+                        Compare FlashInfer attention output with SDPA during prefill (default: False, env: COMPARE_SDPA_PREFILL)
+  --model MODEL         Model type (default: meta-llama/Llama-3.2-1B-Instruct, env: MODEL)
   --torch_dtype TORCH_DTYPE
-                        model dtype: float16, bfloat16, float32 (default: float16, env: TORCH_DTYPE)
+                        Model dtype (default: float16, env: TORCH_DTYPE)
   --torch_dtype_autocast TORCH_DTYPE_AUTOCAST
-                        autocast dtype when model is float32 (default: float16, env: TORCH_DTYPE_AUTOCAST)
+                        Model dtype autocast if the model loaded in float32 (default: float16, env: TORCH_DTYPE_AUTOCAST)
   --torch_profiling TORCH_PROFILING
-                        profile prefill and step with torch profiler (default: False, env: TORCH_PROFILING)
+                        Use torch.autograd.profiler.profile() to profile prefill and step (default: False, env: TORCH_PROFILING)
   --torch_compile TORCH_COMPILE
-                        torch.compile for decode (default: False, env: TORCH_COMPILE)
+                        Torch compile for decoding and sampling (default: False, env: TORCH_COMPILE)
   --torch_compile_mode TORCH_COMPILE_MODE
-                        torch.compile mode (default: default, env: TORCH_COMPILE_MODE)
+                        torch compile mode (default: default, env: TORCH_COMPILE_MODE)
   --cuda_graph CUDA_GRAPH
-                        capture CUDA Graph for decode (default: False, env: CUDA_GRAPH)
+                        Capture CUDA Graph for decoding and sampling (default: False, env: CUDA_GRAPH)
+  --multi_step MULTI_STEP
+                        Number of decode steps to run per round-trip (default: 1, env: MULTI_STEP)
+  --max_prefill_tokens MAX_PREFILL_TOKENS
+                        Max total tokens per prefill batch for chunked prefill, 0 to disable (default: 2048, env: MAX_PREFILL_TOKENS)
+  --skip_batch_decode SKIP_BATCH_DECODE
+                        Call tokenizer.batch_decode synchronously instead of via run_in_executor, useful for throughput benchmarking (default: False, env:
+                        SKIP_BATCH_DECODE)
+  --block_size BLOCK_SIZE
+                        KV cache page block size in tokens (default: 16, env: BLOCK_SIZE)
+  --overlap_logging OVERLAP_LOGGING
+                        Enable communication/computation overlap timing logs into timing_logs global (introduces latency, disabled by default) (default: False,
+                        env: OVERLAP_LOGGING)
 ```
 
 **We support both args and OS environment.**
 
 ## Benchmarks
 
-Benchmarked on **Qwen/Qwen2.5-3B-Instruct** (float16) across concurrency levels 1–128, compared against baseline (no optimizations), SGLang, and vLLM. Each request generates 384 tokens with `ignore_eos: true`.
+Benchmarked on **Qwen/Qwen2.5-3B-Instruct** (float16) on a single **H100 SXM** across concurrency levels 1–128, compared against baseline (no optimizations), SGLang, and vLLM. Each request generates 384 tokens with `ignore_eos: true`. vLLM and SGLang were run with prefix caching disabled for a fair comparison.
 
 ### Time to First Token (TTFT)
 
